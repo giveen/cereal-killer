@@ -198,6 +198,16 @@ REDIS_URL=redis://localhost:6379 python scripts/sync_ippsec.py
 These Make targets enable Docker BuildKit by default, so package download/build caches are reused across rebuilds for faster iteration.
 `make docker-up` intentionally does not attach to the app container. This avoids compose log-prefix interference in fullscreen TUI rendering.
 
+Redis persistence:
+
+- Redis data is stored in a named Docker volume (`redis_data`).
+- This means `make docker-down`, `git pull`, and `make docker-build` do not wipe indexed data.
+- To intentionally reset Redis data, run:
+
+```bash
+docker compose down -v
+```
+
 ## Project Structure
 
 - `src/cereal_killer/main.py`: app entrypoint

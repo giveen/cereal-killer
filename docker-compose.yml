@@ -26,6 +26,8 @@ services:
 
   redis:
     image: redis/redis-stack:latest
+    volumes:
+      - redis_data:/data
     ports:
       - "6379:6379"
       - "8001:8001"
@@ -38,3 +40,6 @@ services:
       - ./config/searxng/settings.yml:/etc/searxng/settings.yml:ro
     ports:
       - "18080:8080"
+
+volumes:
+  redis_data:
