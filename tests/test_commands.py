@@ -108,6 +108,16 @@ class DispatchTests(unittest.TestCase):
         assert result is not None
         self.assertEqual(result.session_prefix, "__loot__")
 
+    def test_dispatch_exit_returns_sentinel(self) -> None:
+        result = _run(dispatch("/exit", None, self.settings))
+        assert result is not None
+        self.assertEqual(result.session_prefix, "__exit__")
+
+    def test_dispatch_quit_alias_returns_sentinel(self) -> None:
+        result = _run(dispatch("/quit", None, self.settings))
+        assert result is not None
+        self.assertEqual(result.session_prefix, "__exit__")
+
     def test_dispatch_box_case_insensitive_name(self) -> None:
         result = _run(dispatch("/box LAME", None, self.settings))
         assert result is not None

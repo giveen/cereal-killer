@@ -124,9 +124,20 @@ async def _check_ippsec_dataset(settings: Settings) -> CheckResult:
         from redis.asyncio import Redis  # type: ignore[import-untyped]
 
         client = Redis.from_url(settings.redis_url, decode_responses=True)
-        keys = await asyncio.wait_for(client.keys("mentor:ippsec:*"), timeout=3.0)
+        info = await asyncio.wait_for(
+            client.execute_command("FT.INFO", settings.redis_index),
+            timeout=3.0,
+        )
         await client.aclose()
-        count = len(keys)
+
+        # FT.INFO returns alternating key/value items.
+        count = 0
+        if isinstance(info, list):
+            for i in range(0, len(info) - 1, 2):
+                if str(info[i]) == "num_docs":
+                    count = int(float(info[i + 1]))
+                    break
+
         if count:
             return CheckResult(
                 label="IppSec",
@@ -141,7 +152,7 @@ async def _check_ippsec_dataset(settings: Settings) -> CheckResult:
             ok=False,
             message=(
                 "[yellow][WARN][/yellow] [b]IppSec dataset[/b] — empty. "
-                "Run scripts/sync_ippsec.py or enjoy flying completely blind."
+                "Run make sync-ippsec (or scripts/sync_ippsec.py) and enjoy being less blind."
             ),
         )
     except Exception as exc:

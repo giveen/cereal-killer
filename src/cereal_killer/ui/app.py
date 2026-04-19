@@ -108,6 +108,9 @@ class CerealKillerApp(App[None]):
             await self._handle_brain_prompt(prompt)
             return
         await self._apply_command_result(result)
+        if result.session_prefix == "__exit__":
+            self.exit()
+            return
         if result.session_prefix == "__loot__":
             await self._handle_loot_report()
         dashboard.set_active_tool("Idle")

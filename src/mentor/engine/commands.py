@@ -189,6 +189,7 @@ async def _cmd_help(args: list[str], engine: object, settings: Settings) -> Comm
         "  [cyan]/loot[/cyan]               — Generate a loot report for the current box",
         "  [cyan]/victory <text>[/cyan]     — Record post-pwn explanation in learnings vault",
         "  [cyan]/clear[/cyan]              — Clear the current box session from Redis",
+        "  [cyan]/exit[/cyan]               — Exit the TUI",
         "  [cyan]/help[/cyan]               — Show this message",
     ]
     return CommandResult(message="\n".join(lines))
@@ -277,6 +278,14 @@ async def _cmd_victory(args: list[str], engine: object, settings: Settings) -> C
     return CommandResult(message=msg)
 
 
+async def _cmd_exit(args: list[str], engine: object, settings: Settings) -> CommandResult:
+    """Exit the TUI."""
+    return CommandResult(
+        message="[yellow]Exiting Cereal Killer...[/yellow]",
+        session_prefix="__exit__",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Registry  —  verb → handler
 # ---------------------------------------------------------------------------
@@ -286,6 +295,8 @@ _REGISTRY: dict[str, _Handler] = {
     "new-box": _cmd_new_box,
     "newbox": _cmd_new_box,      # typo-tolerant alias
     "loot": _cmd_loot,
+    "exit": _cmd_exit,
+    "quit": _cmd_exit,
     "clear": _cmd_clear,
     "victory": _cmd_victory,
     "pwned": _cmd_victory,       # alias

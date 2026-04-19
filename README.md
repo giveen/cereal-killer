@@ -123,6 +123,7 @@ Useful slash commands:
 /loot
 /victory <what-you-learned>
 /clear [machine-name]
+/exit
 ```
 
 Keyboard shortcuts:
