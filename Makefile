@@ -24,8 +24,8 @@ tui:
 		LLM_BASE_URL="$${LLM_BASE_URL:-http://localhost:8000/v1}" \
 		.venv/bin/cereal-killer; \
 	else \
-		echo "cereal-killer is not installed. Run: python -m pip install -e ."; \
-		exit 1; \
+		echo "No local cereal-killer install found. Launching via Docker app service..."; \
+		docker compose run --rm app cereal-killer; \
 	fi
 
 docker-down:
