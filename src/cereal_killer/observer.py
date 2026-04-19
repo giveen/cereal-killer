@@ -1,76 +1,24 @@
 from __future__ import annotations
 
-import asyncio
-import os
-import platform
 from collections.abc import AsyncIterator
-from pathlib import Path
-
-from watchfiles import Change, awatch
-
-from cereal_killer.config import HISTORY_CONTEXT_LIMIT
-
-
-def candidate_history_files() -> list[Path]:
-    home = Path.home()
-    system = platform.system().lower()
-    files = [home / ".zsh_history"]
-    if "darwin" in system or "linux" in system:
-        files.extend([home / ".bash_history", home / ".local/share/fish/fish_history"])
-    elif "windows" in system:
-        files.extend([
-            home / "AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt",
-        ])
-    return [p for p in files if p.exists()]
-
-
-def parse_history_lines(raw: str) -> list[str]:
-    commands: list[str] = []
-    for line in raw.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith(": ") and ";" in stripped:
-            commands.append(stripped.split(";", 1)[1].strip())
-        else:
-            commands.append(stripped)
-    return commands
-
-
-def session_markers() -> list[str]:
-    """Best-effort identifiers that help keep history tied to this shell session."""
-    return [os.getenv("TMUX_PANE", ""), os.getenv("STY", ""), str(os.getppid())]
-
-
-def filter_context_commands(commands: list[str], cwd: str, limit: int = HISTORY_CONTEXT_LIMIT) -> list[str]:
-    cwd = cwd.strip()
-    cwd_name = Path(cwd).name
-    markers = session_markers()
-    filtered = [
-        cmd
-        for cmd in commands
-        if cwd in cmd or (cwd_name and cwd_name in cmd) or any(marker and marker in cmd for marker in markers)
-    ]
-    if not filtered:
-        filtered = commands
-    return filtered[-limit:]
+from mentor.observer.stalker import (
+    HistoryEvent,
+    candidate_history_files,
+    detect_box_cd,
+    detect_feedback_signal,
+    filter_context_commands,
+    is_technical_command,
+    needs_structured_output_hint,
+    observe_history as _observe_history_events,
+    parse_history_lines,
+)
 
 
 async def observe_history(cwd: str) -> AsyncIterator[list[str]]:
-    history_files = candidate_history_files()
-    if not history_files:
-        while True:
-            await asyncio.sleep(5)
-            yield []
+    async for event in _observe_history_events(cwd):
+        yield event.context_commands
 
-    # We monitor the highest-priority shell history file for a single coherent stream.
-    target = history_files[0]
-    async for changes in awatch(target):
-        relevant = any(change in {Change.modified, Change.added} and Path(path) == target for change, path in changes)
-        if not relevant:
-            continue
-        try:
-            text = target.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        yield filter_context_commands(parse_history_lines(text), cwd)
+
+async def observe_history_events(cwd: str) -> AsyncIterator[HistoryEvent]:
+    async for event in _observe_history_events(cwd):
+        yield event

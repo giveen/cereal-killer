@@ -1,0 +1,324 @@
+"""Slash-command router for the Cereal-Killer TUI.
+
+Usage
+-----
+    result = await dispatch(raw_input, engine, settings)
+    if result is not None:
+        # The input was a slash command; result carries the reply.
+        chat_log.write(result.message)
+
+Adding a new command
+--------------------
+1.  Write an async handler `async def _cmd_foo(args, engine, settings) -> CommandResult`.
+2.  Register it in `_REGISTRY` at the bottom of this module.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Awaitable, Callable
+
+from cereal_killer.config import Settings
+from mentor.engine.session import ThinkingSessionStore
+from mentor.kb.query import retrieve_solution_for_machine
+
+
+# ---------------------------------------------------------------------------
+# Public result type
+# ---------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class CommandResult:
+    """Returned by every command handler."""
+    # Human-readable Rich-markup reply to show in the chat log.
+    message: str
+    # When set, the app should update its target machine context.
+    new_target: str | None = None
+    # When True the /box system-prompt block has been applied.
+    context_loaded: bool = False
+    # When True the /new-box exploration mode has been activated.
+    exploration_mode: bool = False
+    # Optional dynamic Redis index prefix created for the session.
+    session_prefix: str | None = None
+    # Optional updated system-prompt addendum the Brain should adopt.
+    system_prompt_addendum: str | None = None
+    # Phase should reset on the UI side.
+    reset_phase: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Handler signature type alias
+# ---------------------------------------------------------------------------
+
+_Handler = Callable[
+    [list[str], "LLMEngineProtocol", Settings],
+    Awaitable[CommandResult],
+]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def is_slash_command(text: str) -> bool:
+    """Return True iff *text* starts with '/' and has at least one word."""
+    stripped = text.strip()
+    return stripped.startswith("/") and len(stripped) > 1
+
+
+def parse_slash_command(text: str) -> tuple[str, list[str]]:
+    """Split ``/box lame`` into ``('box', ['lame'])``.  Always lower-cases the verb."""
+    parts = text.strip().lstrip("/").split()
+    verb = parts[0].lower() if parts else ""
+    args = parts[1:] if len(parts) > 1 else []
+    return verb, args
+
+
+# ---------------------------------------------------------------------------
+# Command handlers
+# ---------------------------------------------------------------------------
+
+async def _cmd_box(args: list[str], engine: object, settings: Settings) -> CommandResult:
+    """Load known-box context: vector-search the IppSec index, inject system prompt block."""
+    if not args:
+        return CommandResult(
+            message="[yellow]Usage:[/yellow] /box <machine-name>  (e.g. /box lame)"
+        )
+
+    machine = args[0].strip().lower()
+    # Retrieve walkthrough material — best-effort; if Redis is down we still proceed.
+    try:
+        solution_md = retrieve_solution_for_machine(settings, machine)
+        has_material = "No Redis walkthrough" not in solution_md
+    except Exception as exc:
+        solution_md = f"[context unavailable: {exc}]"
+        has_material = False
+
+    # Build the system-prompt addendum that Brain will use for this session.
+    addendum = (
+        f"CURRENT TARGET: {machine.upper()}. "
+        "You have access to the known IppSec solution for this machine. "
+        "Use it to guide the user without spoiling, unless the Easy Button is pressed. "
+        "Prioritise this target context over generic advice."
+    )
+    if has_material:
+        # Embed a compact excerpt (first 600 chars) so Brain has grounded context.
+        excerpt = solution_md[:600].replace("\n", " ")
+        addendum += f"\n\nKNOWN MATERIAL EXCERPT:\n{excerpt}"
+
+    context_loaded = has_material
+    if has_material:
+        reply = (
+            f"[green]Context loaded for [b]{machine.upper()}[/b].[/green] "
+            "I have IppSec notes on this one. Try not to make me look bad."
+        )
+    else:
+        reply = (
+            f"[yellow]No IppSec material found for [b]{machine.upper()}[/b].[/yellow] "
+            "Flying blind. Run your recon and I'll improvise."
+        )
+
+    return CommandResult(
+        message=reply,
+        new_target=machine,
+        context_loaded=context_loaded,
+        system_prompt_addendum=addendum,
+        reset_phase=True,
+    )
+
+
+async def _cmd_new_box(args: list[str], engine: object, settings: Settings) -> CommandResult:
+    """Exploration mode: clear known-box context, set inquisitive persona, new Redis prefix."""
+    if not args:
+        return CommandResult(
+            message="[yellow]Usage:[/yellow] /new-box <machine-name>  (e.g. /new-box knife)"
+        )
+
+    machine = args[0].strip().lower()
+    session_prefix = f"session:{machine}"
+
+    # Provision the Redis dynamic index prefix (best-effort).
+    prefix_ready = False
+    try:
+        client_obj = ThinkingSessionStore(settings)
+        redis_client = await client_obj._client()
+        if redis_client is not None:
+            # Write a metadata marker so the prefix exists in Redis.
+            await redis_client.set(
+                f"{session_prefix}:meta",
+                f'{{"machine": "{machine}", "mode": "exploration"}}',
+                ex=60 * 60 * 24 * 14,  # 14-day TTL
+            )
+            prefix_ready = True
+    except Exception:
+        pass
+
+    addendum = (
+        f"CURRENT TARGET: {machine.upper()} — EXPLORATION MODE. "
+        "You do NOT have a pre-loaded walkthrough for this machine. "
+        "Be inquisitive: ask the user for nmap output, feroxbuster results, and service banners. "
+        "Build your mental model from scratch. "
+        "Do NOT pretend to know the solution. "
+        "Treat every new finding as a clue and guide with Socratic questions."
+    )
+
+    prefix_note = (
+        f"  Dynamic session prefix [cyan]{session_prefix}[/cyan] ready in Redis."
+        if prefix_ready
+        else "  (Redis unavailable — prefix not written, but exploration mode is active.)"
+    )
+
+    return CommandResult(
+        message=(
+            f"[cyan]Exploration Mode activated for [b]{machine.upper()}[/b].[/cyan] "
+            "No script to follow here. I'll need your recon output to work with.\n"
+            + prefix_note
+        ),
+        new_target=machine,
+        exploration_mode=True,
+        session_prefix=session_prefix if prefix_ready else None,
+        system_prompt_addendum=addendum,
+        reset_phase=True,
+    )
+
+
+async def _cmd_help(args: list[str], engine: object, settings: Settings) -> CommandResult:
+    lines = [
+        "[b]Available commands:[/b]",
+        "  [cyan]/box <name>[/cyan]         — Load IppSec context for a known box",
+        "  [cyan]/new-box <name>[/cyan]     — Start exploration mode for an unknown box",
+        "  [cyan]/loot[/cyan]               — Generate a loot report for the current box",
+        "  [cyan]/victory <text>[/cyan]     — Record post-pwn explanation in learnings vault",
+        "  [cyan]/clear[/cyan]              — Clear the current box session from Redis",
+        "  [cyan]/help[/cyan]               — Show this message",
+    ]
+    return CommandResult(message="\n".join(lines))
+
+
+async def _cmd_loot(args: list[str], engine: object, settings: Settings) -> CommandResult:
+    """Convenience alias — the UI's handle_pwned wires the actual call."""
+    return CommandResult(
+        message="[dim]Routing to loot report generator...[/dim]",
+        new_target=None,
+        # Signal the UI to trigger handle_pwned logic.
+        context_loaded=False,
+        exploration_mode=False,
+        session_prefix="__loot__",
+    )
+
+
+async def _cmd_clear(args: list[str], engine: object, settings: Settings) -> CommandResult:
+    """Clear the current machine's Redis session."""
+    from pathlib import Path as _Path
+
+    machine = args[0].strip().lower() if args else _Path.cwd().name.lower()
+    try:
+        store = ThinkingSessionStore(settings)
+        await store.clear_session(machine)
+        return CommandResult(
+            message=(
+                f"[green]Redis session cleared for [b]{machine}[/b].[/green] "
+                "Fresh slate. Please try not to repeat all the same mistakes."
+            )
+        )
+    except Exception as exc:
+        return CommandResult(message=f"[red]Clear failed:[/red] {exc}")
+
+
+async def _cmd_victory(args: list[str], engine: object, settings: Settings) -> CommandResult:
+    """Record the user's post-pwn vulnerability explanation in the learnings vault."""
+    explanation = " ".join(args).strip()
+
+    if not explanation:
+        return CommandResult(
+            message=(
+                "[bold green]Pwned![/bold green] "
+                "Before we move on, Zero Cool needs you to prove you actually understand "
+                "what just happened.\n"
+                "[cyan]Usage:[/cyan] /victory <explain the vuln and how you exploited it>\n"
+                "This gets stored in your personal learnings vault and will remind you "
+                "of similar patterns on future boxes."
+            )
+        )
+
+    if len(explanation) < 20:
+        return CommandResult(
+            message=(
+                "[yellow]Put some effort in.[/yellow] "
+                "Write at least a sentence describing the vulnerability and how you got in."
+            )
+        )
+
+    from pathlib import Path as _Path
+    machine = _Path.cwd().name.lower()
+
+    # Store the learning via the engine (graceful if engine is None in tests).
+    recall: list[str] = []
+    try:
+        if engine is not None and hasattr(engine, "store_learning"):
+            await engine.store_learning(machine, explanation)
+        if engine is not None and hasattr(engine, "recall_learnings"):
+            recall = await engine.recall_learnings(explanation, exclude_machine=machine)
+    except Exception:
+        pass
+
+    excerpt = explanation[:200] + ("…" if len(explanation) > 200 else "")
+    msg = (
+        f"[green]✓ Victory learning stored for [b]{machine.upper()}[/b].[/green]\n"
+        f"You wrote: [italic]{excerpt}[/italic]\n"
+        "That's going in the vault. You might actually be learning something."
+    )
+    if recall:
+        msg += (
+            "\n\n[cyan]Zero Cool sees a pattern:[/cyan] "
+            "You've encountered something similar before:\n"
+            + "\n".join(f"  • {r[:160]}" for r in recall[:3])
+        )
+
+    return CommandResult(message=msg)
+
+
+# ---------------------------------------------------------------------------
+# Registry  —  verb → handler
+# ---------------------------------------------------------------------------
+
+_REGISTRY: dict[str, _Handler] = {
+    "box": _cmd_box,
+    "new-box": _cmd_new_box,
+    "newbox": _cmd_new_box,      # typo-tolerant alias
+    "loot": _cmd_loot,
+    "clear": _cmd_clear,
+    "victory": _cmd_victory,
+    "pwned": _cmd_victory,       # alias
+    "help": _cmd_help,
+    "?": _cmd_help,
+}
+
+
+# ---------------------------------------------------------------------------
+# Public dispatch entry point
+# ---------------------------------------------------------------------------
+
+async def dispatch(
+    raw_input: str,
+    engine: object,
+    settings: Settings,
+) -> CommandResult | None:
+    """Parse *raw_input*; if it's a slash command dispatch it and return the result.
+
+    Returns *None* when the input is not a slash command so the caller can
+    fall through to normal chat handling.
+    """
+    if not is_slash_command(raw_input):
+        return None
+
+    verb, args = parse_slash_command(raw_input)
+    handler = _REGISTRY.get(verb)
+    if handler is None:
+        return CommandResult(
+            message=(
+                f"[red]Unknown command:[/red] /{verb}  "
+                "— type [cyan]/help[/cyan] for a list."
+            )
+        )
+
+    return await handler(args, engine, settings)

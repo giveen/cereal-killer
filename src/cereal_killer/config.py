@@ -11,6 +11,12 @@ class Settings:
     llm_base_url: str = os.getenv("LLM_BASE_URL", "http://host.docker.internal:8000/v1")
     llm_api_key: str = os.getenv("LLM_API_KEY", "not-needed")
     llm_model: str = os.getenv("LLM_MODEL", "qwen3.6")
+    reasoning_parser: str = os.getenv("REASONING_PARSER", "qwen3")
+    max_model_len: int = int(os.getenv("MAX_MODEL_LEN", "262144"))
+    # SearXNG last-resort web search.  Empty string disables the feature.
+    searxng_base_url: str = os.getenv("SEARXNG_BASE_URL", "http://searxng:8080")
+    # Minimum Redis vector similarity (0-1) before falling back to web search.
+    searxng_vector_threshold: float = float(os.getenv("SEARXNG_VECTOR_THRESHOLD", "0.7"))
 
 
 HISTORY_CONTEXT_LIMIT = 50
