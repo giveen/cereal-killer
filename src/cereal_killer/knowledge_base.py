@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from array import array
 from dataclasses import dataclass
 from typing import Any
@@ -88,12 +89,48 @@ class KnowledgeBase:
 
 def transform_dataset(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
     docs: list[dict[str, Any]] = []
+
+    def _normalize_machine(raw: str) -> str:
+        name = (raw or "").strip()
+        lowered = name.lower()
+        if lowered.startswith("hackthebox - "):
+            name = name[len("HackTheBox - "):]
+        name = re.sub(r"\s+", " ", name).strip()
+        return name
+
+    def _timestamp_to_seconds(ts: Any) -> int:
+        if isinstance(ts, dict):
+            minutes = int(ts.get("minutes", 0) or 0)
+            seconds = int(ts.get("seconds", 0) or 0)
+            return max(0, minutes * 60 + seconds)
+        return 0
+
     for idx, item in enumerate(data):
-        machine = str(item.get("machine", item.get("name", "unknown")))
-        title = str(item.get("title", item.get("name", "walkthrough")))
-        url = str(item.get("url", item.get("link", "")))
-        notes = item.get("description") or item.get("notes") or ""
-        content = f"{machine}\n{title}\n{notes}\n{url}".strip()
+        machine_raw = str(item.get("machine", item.get("name", "unknown")))
+        machine = _normalize_machine(machine_raw)
+        video_id = str(item.get("videoId", "")).strip()
+        timestamp_secs = _timestamp_to_seconds(item.get("timestamp"))
+        line = str(item.get("line", "")).strip()
+        tag = str(item.get("tag", "")).strip()
+        academy = str(item.get("academy", "")).strip()
+        title = str(item.get("title") or item.get("name") or "walkthrough")
+        url = str(item.get("url") or item.get("link") or "")
+        if not url and video_id:
+            url = f"https://www.youtube.com/watch?v={video_id}&t={timestamp_secs}s"
+
+        content_parts = [
+            f"machine: {machine}",
+            f"source_machine: {machine_raw}",
+            f"title: {title}",
+            f"line: {line}" if line else "",
+            f"tag: {tag}" if tag else "",
+            f"academy: {academy}" if academy else "",
+            f"video_id: {video_id}" if video_id else "",
+            f"timestamp_seconds: {timestamp_secs}" if timestamp_secs else "",
+            url,
+        ]
+        content = "\n".join(part for part in content_parts if part).strip()
+
         docs.append(
             {
                 "id": f"ippsec-{idx}",

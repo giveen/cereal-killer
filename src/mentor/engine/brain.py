@@ -138,6 +138,7 @@ class Brain:
         # --- Tiered search: Redis VDB first, SearXNG as last resort -----
         # Web search is only enabled when pedagogy reaches DIRECT level.
         allow_web = self._pedagogy.should_allow_web_search()
+        active_target = self._active_target_machine()
         if self.on_web_search_state_change:
             self.on_web_search_state_change(True)
         try:
@@ -145,6 +146,7 @@ class Brain:
                 query=tool_command or user_prompt,
                 settings=self.settings,
                 history_commands=history_commands,
+                target_machine=active_target,
                 vector_threshold=self.settings.searxng_vector_threshold,
                 allow_web=allow_web,
             )
@@ -266,6 +268,7 @@ class Brain:
             command_or_prompt=user_prompt,
             context_commands=history_commands,
             top_k=3,
+            target_machine=self._active_target_machine(),
         )
         system_prompt = (
             f"{self.system_prompt}\n\n"
@@ -315,9 +318,11 @@ class Brain:
                     **extra_body,
                 )
                 message = response["choices"][0]["message"]
-                content = message.get("content") or ""
-                reasoning_content = message.get("reasoning_content") or ""
-                return str(content), str(reasoning_content)
+                content, reasoning_content = self._normalise_completion_payload(
+                    message.get("content") or "",
+                    message.get("reasoning_content") or "",
+                )
+                return content, reasoning_content
 
         if self._client is None:
             raise RuntimeError("No LLM client available. Install openai or enable LiteLLM with USE_LITELLM=1.")
@@ -329,9 +334,10 @@ class Brain:
             extra_body=extra_body,
         )
         message = completion.choices[0].message
-        content = message.content or ""
-        reasoning_content = getattr(message, "reasoning_content", "") or ""
-        return content, str(reasoning_content)
+        return self._normalise_completion_payload(
+            message.content or "",
+            getattr(message, "reasoning_content", "") or "",
+        )
 
     async def _chat_completion_with_image(
         self,
@@ -376,9 +382,19 @@ class Brain:
             extra_body=extra_body,
         )
         message = completion.choices[0].message
-        content = message.content or ""
-        reasoning_content = getattr(message, "reasoning_content", "") or ""
-        return content, str(reasoning_content)
+        return self._normalise_completion_payload(
+            message.content or "",
+            getattr(message, "reasoning_content", "") or "",
+        )
+
+    @staticmethod
+    def _normalise_completion_payload(content: str, reasoning_content: str) -> tuple[str, str]:
+        """Avoid blank assistant replies when providers emit reasoning-only output."""
+        clean_content = str(content or "")
+        clean_reasoning = str(reasoning_content or "")
+        if clean_content.strip() or not clean_reasoning.strip():
+            return clean_content, clean_reasoning
+        return clean_reasoning, ""
 
     async def generate_loot_report(
         self,
@@ -517,6 +533,12 @@ class Brain:
         if "/ip" in blob or "ip parameter" in blob:
             return "Status: User is stuck on the /ip parameter behavior"
         return "Status: User is stuck; prior hints did not produce progress"
+
+    def _active_target_machine(self) -> str | None:
+        match = re.search(r"CURRENT TARGET:\s*([A-Za-z][A-Za-z0-9-]{0,23})", self.system_prompt_addendum)
+        if not match:
+            return None
+        return match.group(1).strip().lower()
 
     @staticmethod
     def _file_to_data_uri(image_path: str) -> str:

@@ -63,6 +63,7 @@ async def tiered_search(
     settings: Settings,
     history_commands: list[str] | None = None,
     *,
+    target_machine: str | None = None,
     vector_threshold: float = _DEFAULT_VECTOR_THRESHOLD,
     force_web: bool = False,
     allow_web: bool = True,
@@ -91,6 +92,7 @@ async def tiered_search(
         command_or_prompt=query,
         context_commands=history_commands,
         top_k=3,
+        target_machine=target_machine,
     )
     best_score = _best_vector_score(vector_snippets)
 

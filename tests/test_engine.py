@@ -74,6 +74,16 @@ class BrainContextHelpersTests(unittest.TestCase):
         )
         self.assertIn("/ip parameter", status)
 
+    def test_normalise_completion_payload_promotes_reasoning_when_content_empty(self) -> None:
+        content, reasoning = Brain._normalise_completion_payload("", "Reasoning-only output")
+        self.assertEqual(content, "Reasoning-only output")
+        self.assertEqual(reasoning, "")
+
+    def test_normalise_completion_payload_preserves_regular_content(self) -> None:
+        content, reasoning = Brain._normalise_completion_payload("Final answer", "Hidden thoughts")
+        self.assertEqual(content, "Final answer")
+        self.assertEqual(reasoning, "Hidden thoughts")
+
 
 if __name__ == "__main__":
     unittest.main()
