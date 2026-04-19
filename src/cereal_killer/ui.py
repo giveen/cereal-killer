@@ -181,15 +181,6 @@ class MainDashboard(App[None]):
         color: #9fe8ff;
         padding: 0 1;
     }
-    #command_shelf {
-        margin-top: 1;
-        border: tall #1dd1a1;
-        background: #101715;
-    }
-    #command_links {
-        height: auto;
-        padding: 0 1 1 1;
-    }
     .command-link {
         width: 100%;
         margin-top: 1;
@@ -249,15 +240,6 @@ class MainDashboard(App[None]):
         text-style: bold;
         margin-bottom: 1;
     }
-    #utility_actions {
-        height: auto;
-        margin-top: 1;
-        margin-bottom: 1;
-    }
-    #utility_actions Button {
-        width: 100%;
-        margin-top: 1;
-    }
     #easy_button {
         dock: bottom;
         min-height: 3;
@@ -307,8 +289,6 @@ class MainDashboard(App[None]):
                 yield RichLog(id="chat_log", markup=True, wrap=True, highlight=True)
                 with Collapsible(title="LLM Reasoning", id="reasoning_box", collapsed=False):
                     yield Markdown("_No reasoning yet._", id="reasoning_markdown")
-                with Collapsible(title="Suggested Commands", id="command_shelf", collapsed=True):
-                    yield Vertical(id="command_links")
                 yield Input(placeholder="Prompt Zero Cool...", id="user_prompt")
             with Vertical(id="intel_sidebar"):
                 yield Static("CURRENT PHASE\n[IDLE]", id="current_phase")
@@ -317,10 +297,6 @@ class MainDashboard(App[None]):
                 yield Static("PATHETIC METER", id="pathetic_meter")
                 yield VerticalProgressBar(max_value=10, value=0, height=10, id="pathetic-meter-bar")
                 yield Static("0/10", id="pathetic-meter-value")
-                with Vertical(id="utility_actions"):
-                    yield Button("Vision", id="vision-button")
-                    yield Button("Copy Last Code Block", id="copy-code-button")
-                    yield Button("[b]Mark as Pwned[/b]", id="pwned-button")
                 yield Button("EASY", id="easy_button")
         yield Footer()
 
@@ -805,7 +781,10 @@ class MainDashboard(App[None]):
 
     async def _refresh_command_links(self, answer: str) -> None:
         commands = self._extract_suggested_commands(answer)
-        container = self.query_one("#command_links", Vertical)
+        try:
+            container = self.query_one("#command_links", Vertical)
+        except NoMatches:
+            return
         for child in list(container.children):
             if isinstance(child, CommandLink):
                 child.remove()
