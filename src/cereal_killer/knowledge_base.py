@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from array import array
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +17,11 @@ IPPSEC_DATASET_URL = "https://raw.githubusercontent.com/IppSec/ippsec.github.io/
 # Lightweight deterministic embedding size for hash-based fallback vectors.
 # 64 dims keeps storage/query overhead low while still producing stable ordering.
 EMBEDDING_DIMS = 64
+
+
+def _vector_to_bytes(values: list[float]) -> bytes:
+    # Redis hash vector fields expect a binary float buffer.
+    return array("f", values).tobytes()
 
 
 @dataclass(slots=True)
@@ -95,7 +101,7 @@ def transform_dataset(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "title": title,
                 "url": url,
                 "content": content,
-                "embedding": KnowledgeBase.embed(content),
+                "embedding": _vector_to_bytes(KnowledgeBase.embed(content)),
             }
         )
     return docs

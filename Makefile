@@ -32,4 +32,4 @@ docker-down:
 	docker compose down
 
 sync-ippsec:
-	docker compose run --rm app python scripts/sync_ippsec.py
+	docker compose run --rm --build app python scripts/sync_ippsec.py

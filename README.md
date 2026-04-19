@@ -148,7 +148,7 @@ No local virtual environment is required if you use Docker:
 make sync-ippsec
 ```
 
-This runs the sync inside the app container.
+This runs the sync inside the app container and rebuilds the app image first so recent code changes from `git pull` are applied.
 
 To sync from your host Python environment instead:
 
