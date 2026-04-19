@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import re
 import time as _time
@@ -34,7 +35,6 @@ class CerealKillerApp(App[None]):
     CSS_PATH = Path(__file__).with_name("styles.tcss")
     BINDINGS = [
         ("ctrl+c", "quit", "Quit"),
-        ("ctrl+t", "toggle_thinking", "Toggle Thinking"),
         ("ctrl+b", "pulse_easy_button", "Easy Button"),
     ]
 
@@ -127,8 +127,9 @@ class CerealKillerApp(App[None]):
             dashboard.append_system(f"LLM error: {exc}", style="red")
             dashboard.set_active_tool("Idle")
             return
-        await dashboard.thought_box().stream_thought(response.reasoning_content or response.thought)
+        await dashboard.stream_thought(response.reasoning_content or response.thought)
         self._track_code_block(response.answer)
+        self._warn_if_repetitive_response(response.answer)
         self._append_chat("assistant", response.answer)
         dashboard.append_assistant(response.answer)
         phase = detect_phase(self.history_context)
@@ -149,7 +150,8 @@ class CerealKillerApp(App[None]):
         except Exception as exc:
             dashboard.append_system(f"Loot report error: {exc}", style="red")
             return
-        await dashboard.thought_box().stream_thought(response.reasoning_content or response.thought)
+        await dashboard.stream_thought(response.reasoning_content or response.thought)
+        self._warn_if_repetitive_response(response.answer)
         dashboard.append_assistant(response.answer)
         self._append_chat("assistant", response.answer)
 
@@ -217,7 +219,8 @@ class CerealKillerApp(App[None]):
                 dashboard.set_active_tool("Idle")
                 continue
 
-            await dashboard.thought_box().stream_thought(response.reasoning_content or response.thought)
+            await dashboard.stream_thought(response.reasoning_content or response.thought)
+            self._warn_if_repetitive_response(response.answer)
             self._append_chat("assistant", response.answer)
             self._track_code_block(response.answer)
             dashboard.append_assistant(response.answer)
@@ -233,10 +236,6 @@ class CerealKillerApp(App[None]):
         machine_name = Path.cwd().name
         solution_markdown = retrieve_solution_for_machine(self.kb.settings, machine_name)
         self.push_screen(SolutionModal(solution_markdown))
-
-    def action_toggle_thinking(self) -> None:
-        thought_box = self._dashboard().thought_box()
-        thought_box.collapsed = not thought_box.collapsed
 
     def action_pulse_easy_button(self) -> None:
         easy_button = self._dashboard().query_one("#easy_button", PulsingEasyButton)
@@ -320,6 +319,22 @@ class CerealKillerApp(App[None]):
                 "timestamp": datetime.now(UTC).isoformat(),
             }
         )
+
+    def _warn_if_repetitive_response(self, new_response: str) -> None:
+        last_assistant = ""
+        for entry in reversed(self.chat_transcript):
+            if entry.get("role") == "assistant":
+                last_assistant = str(entry.get("text", ""))
+                break
+        if not last_assistant or not new_response:
+            return
+        ratio = difflib.SequenceMatcher(None, last_assistant, new_response).ratio()
+        if ratio >= 0.90:
+            self.notify(
+                "[System] Zero Cool is repeating himself. Try providing more specific tool output.",
+                title="Repetition Warning",
+                severity="warning",
+            )
 
     def _track_code_block(self, response_text: str) -> None:
         matches = CODE_BLOCK_PATTERN.findall(response_text)

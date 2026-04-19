@@ -12,7 +12,7 @@ from textual.widgets import Button, Markdown, RichLog, Static
 
 from mentor.utils.clipboard import copy_text
 
-from .widgets import CommandInput, SidebarStatus, ThoughtBox, VerticalProgressBar
+from .widgets import CommandInput, SidebarStatus, VerticalProgressBar
 
 
 CODE_BLOCK_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]+)?\n(.*?)```", re.DOTALL)
@@ -77,7 +77,6 @@ class MainDashboard(Screen[None]):
             with Horizontal(id="main_row"):
                 with Vertical(id="left_pane"):
                     yield RichLog(id="chat_log", markup=True, wrap=True, highlight=True)
-                    yield ThoughtBox(collapsed=False)
                 yield SidebarStatus()
             with Horizontal(id="bottom_row"):
                 yield CommandInput()
@@ -85,8 +84,9 @@ class MainDashboard(Screen[None]):
     def chat_log(self) -> RichLog:
         return self.query_one("#chat_log", RichLog)
 
-    def thought_box(self) -> ThoughtBox:
-        return self.query_one(ThoughtBox)
+    async def stream_thought(self, thought: str) -> None:
+        """Thought panel removed; keep async call sites stable."""
+        return
 
     def append_user(self, text: str) -> None:
         self.chat_log().write(f"[cyan]You>[/cyan] {text}")
