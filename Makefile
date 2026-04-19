@@ -1,4 +1,4 @@
-.PHONY: docker-build docker-up docker-down
+.PHONY: docker-build docker-up docker-down tui
 
 DOCKER_BUILDKIT ?= 1
 COMPOSE_DOCKER_CLI_BUILD ?= 1
@@ -10,7 +10,23 @@ docker-build:
 	docker compose build
 
 docker-up:
-	docker compose up --build
+	docker compose up -d --build redis searxng
+
+tui:
+	@if command -v cereal-killer >/dev/null 2>&1; then \
+		REDIS_URL="$${REDIS_URL:-redis://localhost:6379}" \
+		SEARXNG_BASE_URL="$${SEARXNG_BASE_URL:-http://localhost:18080}" \
+		LLM_BASE_URL="$${LLM_BASE_URL:-http://localhost:8000/v1}" \
+		cereal-killer; \
+	elif [ -x .venv/bin/cereal-killer ]; then \
+		REDIS_URL="$${REDIS_URL:-redis://localhost:6379}" \
+		SEARXNG_BASE_URL="$${SEARXNG_BASE_URL:-http://localhost:18080}" \
+		LLM_BASE_URL="$${LLM_BASE_URL:-http://localhost:8000/v1}" \
+		.venv/bin/cereal-killer; \
+	else \
+		echo "cereal-killer is not installed. Run: python -m pip install -e ."; \
+		exit 1; \
+	fi
 
 docker-down:
 	docker compose down

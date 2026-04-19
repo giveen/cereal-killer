@@ -27,6 +27,10 @@ class LLMEngine:
     def __init__(self, settings: Settings) -> None:
         self._brain = Brain(settings)
 
+    @property
+    def settings(self) -> Settings:
+        return self._brain.settings
+
     async def chat(
         self,
         user_prompt: str,

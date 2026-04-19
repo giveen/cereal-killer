@@ -20,18 +20,21 @@ cp .env.example .env
 ```bash
 make docker-build
 make docker-up
+make tui
 ```
 
 Or run directly with Docker Compose:
 
 ```bash
-docker compose up --build
+docker compose up -d --build redis searxng
+cereal-killer
 ```
 
 This starts:
-- `app` (the TUI)
 - `redis` (Redis Stack)
 - `searxng` (optional web search backend used as last resort)
+
+Then `make tui` (or `cereal-killer`) launches the Textual UI from your host shell.
 
 SearXNG is exposed on `http://localhost:18080`.
 
@@ -113,10 +116,12 @@ Keyboard shortcuts:
 ## Docker Commands
 
 - `make docker-build`: build service images
-- `make docker-up`: build and start the stack
+- `make docker-up`: build and start Redis + SearXNG in the background
+- `make tui`: launch the Textual app locally (expects `cereal-killer` to be installed)
 - `make docker-down`: stop and remove the stack
 
 These Make targets enable Docker BuildKit by default, so package download/build caches are reused across rebuilds for faster iteration.
+`make docker-up` intentionally does not attach to the app container. This avoids compose log-prefix interference in fullscreen TUI rendering.
 
 ## Example Workflow
 
