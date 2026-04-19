@@ -13,6 +13,9 @@ from redisvl.schema import IndexSchema
 from cereal_killer.config import Settings, get_settings
 
 IPPSEC_DATASET_URL = "https://raw.githubusercontent.com/IppSec/ippsec.rocks/master/dataset.json"
+# Lightweight deterministic embedding size for hash-based fallback vectors.
+# 64 dims keeps storage/query overhead low while still producing stable ordering.
+EMBEDDING_DIMS = 64
 
 
 @dataclass(slots=True)
@@ -33,7 +36,7 @@ class KnowledgeBase:
                         "type": "vector",
                         "attrs": {
                             "algorithm": "flat",
-                            "dims": 64,
+                            "dims": EMBEDDING_DIMS,
                             "distance_metric": "cosine",
                             "datatype": "float32",
                         },
@@ -45,15 +48,19 @@ class KnowledgeBase:
     def _index(self) -> SearchIndex:
         return SearchIndex(schema=self._schema(), redis_url=self.settings.redis_url)
 
+    def index(self) -> SearchIndex:
+        return self._index()
+
     @staticmethod
-    def embed(text: str, dims: int = 64) -> list[float]:
+    def embed(text: str, dims: int = EMBEDDING_DIMS) -> list[float]:
+        # Deterministic hash embedding fallback for environments without embedding models.
         digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).digest()
         vals = [((digest[i % len(digest)] / 255.0) * 2) - 1 for i in range(dims)]
         return vals
 
     def lookup_walkthrough(self, query: str = "full machine walkthrough") -> str:
         try:
-            idx = self._index()
+            idx = self.index()
             query_vec = self.embed(query)
             result = idx.query(
                 VectorQuery(
@@ -109,7 +116,8 @@ def sync_ippsec_dataset() -> None:
         data = payload
 
     docs = transform_dataset(data)
-    index = kb._index()
+    index = kb.index()
+    # Keep existing index configuration/data unless it does not exist yet.
     index.create(overwrite=False, drop=False)
     if docs:
         index.load(docs, id_field="id")

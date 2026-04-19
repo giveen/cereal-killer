@@ -34,6 +34,8 @@ class WalkthroughModal(ModalScreen[None]):
 
 
 class CerealKillerApp(App[None]):
+    EASY_BUTTON_PULSE_SECONDS = 0.7
+
     CSS = """
     #root { height: 1fr; }
     #sidebar { width: 33%; min-width: 28; border: solid red; padding: 1; }
@@ -83,7 +85,7 @@ class CerealKillerApp(App[None]):
     async def on_mount(self) -> None:
         self.query_one("#chat-log", RichLog).write("[green]Zero Cool online.[/green]")
         self.query_one("#easy-button", Button).add_class("easy-on")
-        self.set_interval(0.7, self._pulse_easy_button)
+        self.set_interval(self.EASY_BUTTON_PULSE_SECONDS, self._pulse_easy_button)
         self.observer_task = asyncio.create_task(self._observe())
 
     async def on_unmount(self) -> None:

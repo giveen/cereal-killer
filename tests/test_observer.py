@@ -13,6 +13,14 @@ class ObserverTests(unittest.TestCase):
         filtered = filter_context_commands(commands, "/tmp/project")
         self.assertEqual(len(filtered), 50)
         self.assertEqual(filtered[0], "cd /tmp/project && cmd 30")
+        self.assertEqual(filtered[-1], "cd /tmp/project && cmd 79")
+
+    def test_filter_handles_empty_history(self) -> None:
+        self.assertEqual(filter_context_commands([], "/tmp/project"), [])
+
+    def test_filter_returns_all_when_under_limit(self) -> None:
+        commands = ["pwd", "ls", "cat notes.txt"]
+        self.assertEqual(filter_context_commands(commands, "/tmp/project"), commands)
 
 
 if __name__ == "__main__":

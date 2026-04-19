@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from openai import AsyncOpenAI
 
-from cereal_killer.config import Settings
+from cereal_killer.config import HISTORY_CONTEXT_LIMIT, Settings
 
 
 THOUGHT_PATTERN = re.compile(r"<thought>(.*?)</thought>", re.DOTALL | re.IGNORECASE)
@@ -30,7 +30,7 @@ class LLMEngine:
 
     async def chat(self, user_prompt: str, history_commands: list[str] | None = None) -> LLMResponse:
         history_commands = history_commands or []
-        context_block = "\n".join(f"- {cmd}" for cmd in history_commands[-50:])
+        context_block = "\n".join(f"- {cmd}" for cmd in history_commands[-HISTORY_CONTEXT_LIMIT:])
         completion = await self.client.chat.completions.create(
             model=self.settings.llm_model,
             messages=[

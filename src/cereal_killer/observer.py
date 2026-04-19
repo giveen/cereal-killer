@@ -8,6 +8,8 @@ from pathlib import Path
 
 from watchfiles import Change, awatch
 
+from cereal_killer.config import HISTORY_CONTEXT_LIMIT
+
 
 def candidate_history_files() -> list[Path]:
     home = Path.home()
@@ -35,14 +37,19 @@ def parse_history_lines(raw: str) -> list[str]:
     return commands
 
 
-def filter_context_commands(commands: list[str], cwd: str, limit: int = 50) -> list[str]:
+def session_markers() -> list[str]:
+    """Best-effort identifiers that help keep history tied to this shell session."""
+    return [os.getenv("TMUX_PANE", ""), os.getenv("STY", ""), str(os.getppid())]
+
+
+def filter_context_commands(commands: list[str], cwd: str, limit: int = HISTORY_CONTEXT_LIMIT) -> list[str]:
     cwd = cwd.strip()
     cwd_name = Path(cwd).name
-    session_markers = [os.getenv("TMUX_PANE", ""), os.getenv("STY", ""), str(os.getppid())]
+    markers = session_markers()
     filtered = [
         cmd
         for cmd in commands
-        if cwd in cmd or (cwd_name and cwd_name in cmd) or any(marker and marker in cmd for marker in session_markers)
+        if cwd in cmd or (cwd_name and cwd_name in cmd) or any(marker and marker in cmd for marker in markers)
     ]
     if not filtered:
         filtered = commands
@@ -56,6 +63,7 @@ async def observe_history(cwd: str) -> AsyncIterator[list[str]]:
             await asyncio.sleep(5)
             yield []
 
+    # We monitor the highest-priority shell history file for a single coherent stream.
     target = history_files[0]
     async for changes in awatch(target):
         relevant = any(change in {Change.modified, Change.added} and Path(path) == target for change, path in changes)

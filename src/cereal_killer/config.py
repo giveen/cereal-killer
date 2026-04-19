@@ -13,5 +13,8 @@ class Settings:
     llm_model: str = os.getenv("LLM_MODEL", "qwen3.6")
 
 
+HISTORY_CONTEXT_LIMIT = 50
+
+
 def get_settings() -> Settings:
     return Settings()
