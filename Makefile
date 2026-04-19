@@ -29,7 +29,7 @@ tui:
 	fi
 
 docker-down:
-	docker compose down
+	docker compose down --remove-orphans
 
 sync-ippsec:
 	docker compose run --rm --build app python scripts/sync_ippsec.py
