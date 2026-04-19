@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cereal-killer"
+version = "0.1.0"
+description = "Textual + RedisVL TUI assistant"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "textual>=0.70.0",
+  "watchfiles>=0.23.0",
+  "redisvl>=0.5.0",
+  "openai>=1.40.0",
+  "httpx>=0.27.0",
+]
+
+[project.scripts]
+cereal-killer = "cereal_killer.main:main"
+sync-ippsec = "cereal_killer.knowledge_base:sync_ippsec_dataset"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
