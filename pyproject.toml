@@ -26,5 +26,8 @@ sync-ippsec = "cereal_killer.knowledge_base:sync_ippsec_dataset"
 [tool.setuptools]
 package-dir = {"" = "src"}
 
+[tool.setuptools.package-data]
+"cereal_killer.ui" = ["*.tcss"]
+
 [tool.setuptools.packages.find]
 where = ["src"]

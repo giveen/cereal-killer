@@ -25,7 +25,7 @@ tui:
 		.venv/bin/cereal-killer; \
 	else \
 		echo "No local cereal-killer install found. Launching via Docker app service..."; \
-		docker compose run --rm app cereal-killer; \
+		docker compose run --rm --build app cereal-killer; \
 	fi
 
 docker-down:

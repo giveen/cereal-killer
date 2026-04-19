@@ -172,7 +172,7 @@ REDIS_URL=redis://localhost:6379 python scripts/sync_ippsec.py
 
 - `make docker-build`: build service images
 - `make docker-up`: build and start Redis + SearXNG in the background
-- `make tui`: launch the Textual app (uses local install if available, otherwise falls back to `docker compose run --rm app cereal-killer`)
+- `make tui`: launch the Textual app (uses local install if available, otherwise falls back to `docker compose run --rm --build app cereal-killer`)
 - `make docker-down`: stop and remove the stack
 
 These Make targets enable Docker BuildKit by default, so package download/build caches are reused across rebuilds for faster iteration.
