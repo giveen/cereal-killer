@@ -204,6 +204,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -q
 - If your model runs on another computer, make sure that host allows inbound traffic on the model port (for example `8000`) and that Docker can route to it.
 - If knowledge lookup is empty, ensure Redis is reachable and run dataset sync.
 - If Docker app cannot call host model, check `host.docker.internal` routing and the compose `extra_hosts` setting.
+- SearXNG config is mounted as a read-only file (`config/searxng/settings.yml`) to avoid container ownership/permission drift in the repo. This prevents common `git pull` and `git reset` failures caused by root or container UID rewrites on tracked files.
 
 ## Contributing
 

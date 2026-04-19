@@ -35,6 +35,6 @@ services:
     environment:
       SEARXNG_SECRET: ${SEARXNG_SECRET:-change-me-in-production}
     volumes:
-      - ./config/searxng:/etc/searxng:rw
+      - ./config/searxng/settings.yml:/etc/searxng/settings.yml:ro
     ports:
       - "18080:8080"
