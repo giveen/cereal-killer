@@ -91,9 +91,9 @@ class ChecklistWidget(Static):
         ]
 
     def on_mount(self) -> None:
-        self._render()
+        self._render_checklist()
 
-    def _render(self) -> None:
+    def _render_checklist(self) -> None:
         lines = ["[b]Checklist[/b]"]
         for label, _, checked in self._items:
             mark = "[green]✓[/green]" if checked else "[grey42][ ][/grey42]"
@@ -111,13 +111,13 @@ class ChecklistWidget(Static):
             updated.append((label, pattern, checked))
         self._items = updated
         if changed:
-            self._render()
+            self._render_checklist()
         return changed
 
     def reset(self) -> None:
         """Uncheck all items (call on /box or /new-box)."""
         self._items = [(lbl, pat, False) for lbl, pat, _ in self._items]
-        self._render()
+        self._render_checklist()
 
 
 class MainDashboard(App[None]):
