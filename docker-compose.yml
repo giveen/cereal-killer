@@ -37,4 +37,4 @@ services:
     volumes:
       - ./config/searxng:/etc/searxng:rw
     ports:
-      - "8080:8080"
+      - "18080:8080"

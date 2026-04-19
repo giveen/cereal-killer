@@ -33,6 +33,8 @@ This starts:
 - `redis` (Redis Stack)
 - `searxng` (optional web search backend used as last resort)
 
+SearXNG is exposed on `http://localhost:18080`.
+
 To stop services:
 
 ```bash
@@ -113,6 +115,8 @@ Keyboard shortcuts:
 - `make docker-build`: build service images
 - `make docker-up`: build and start the stack
 - `make docker-down`: stop and remove the stack
+
+These Make targets enable Docker BuildKit by default, so package download/build caches are reused across rebuilds for faster iteration.
 
 ## Example Workflow
 
