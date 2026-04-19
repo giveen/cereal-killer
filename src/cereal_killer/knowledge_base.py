@@ -12,7 +12,7 @@ from redisvl.schema import IndexSchema
 
 from cereal_killer.config import Settings, get_settings
 
-IPPSEC_DATASET_URL = "https://raw.githubusercontent.com/IppSec/ippsec.rocks/master/dataset.json"
+IPPSEC_DATASET_URL = "https://raw.githubusercontent.com/IppSec/ippsec.github.io/master/dataset.json"
 # Lightweight deterministic embedding size for hash-based fallback vectors.
 # 64 dims keeps storage/query overhead low while still producing stable ordering.
 EMBEDDING_DIMS = 64
