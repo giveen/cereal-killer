@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import platform
 import re
 import shlex
@@ -9,6 +10,11 @@ import time as _time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
+
+try:
+    import pwd
+except ImportError:  # pragma: no cover - unavailable on Windows
+    pwd = None  # type: ignore[assignment]
 
 try:
     from watchfiles import Change, awatch
@@ -56,14 +62,73 @@ class HistoryEvent:
 
 
 def candidate_history_files() -> list[Path]:
-    home = Path.home()
+    homes = candidate_user_homes()
     system = platform.system().lower()
-    candidates = [home / ".zsh_history"]
+    candidates: list[Path] = []
     if "darwin" in system or "linux" in system:
-        candidates.extend([home / ".bash_history", home / ".local/share/fish/fish_history"])
+        suffixes = [
+            ".zsh_history",
+            ".bash_history",
+            ".local/share/fish/fish_history",
+        ]
     elif "windows" in system:
-        candidates.append(home / "AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt")
+        suffixes = ["AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt"]
+    else:
+        suffixes = [".zsh_history", ".bash_history"]
+
+    for home in homes:
+        candidates.extend(home / suffix for suffix in suffixes)
+
     return [path for path in candidates if path.exists()]
+
+
+def candidate_user_homes() -> list[Path]:
+    """Return plausible user-home paths, preferring the logged-in user over root."""
+
+    candidates: list[Path] = []
+
+    def _add(path: str | Path | None) -> None:
+        if not path:
+            return
+        candidate = Path(path).expanduser()
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    # Prefer sudo-invoking user when running as root under sudo.
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and pwd is not None:
+        try:
+            _add(pwd.getpwnam(sudo_user).pw_dir)
+        except KeyError:
+            pass
+
+    # Include explicit HOME and current process user home.
+    _add(os.environ.get("HOME"))
+    if pwd is not None:
+        try:
+            _add(pwd.getpwuid(os.getuid()).pw_dir)
+        except KeyError:
+            pass
+    _add(Path.home())
+
+    # Add user homes hinted by common identity env vars.
+    for env_var in ("LOGNAME", "USER"):
+        username = os.environ.get(env_var)
+        if not username:
+            continue
+        if pwd is None:
+            continue
+        try:
+            _add(pwd.getpwnam(username).pw_dir)
+        except KeyError:
+            continue
+
+    # Keep root home as a last resort when other homes are present.
+    root_home = Path("/root")
+    if root_home in candidates and len(candidates) > 1:
+        candidates = [path for path in candidates if path != root_home] + [root_home]
+
+    return candidates
 
 
 def parse_history_lines(raw: str) -> list[str]:
@@ -213,17 +278,22 @@ def needs_structured_output_hint(command: str) -> bool:
 
 
 def candidate_feedback_files() -> list[Path]:
-    home = Path.home()
-    candidates = [
-        home / ".mentor_terminal_feedback.log",
-        home / "htb/session.log",
-    ]
+    candidates: list[Path] = []
+    for home in candidate_user_homes():
+        candidates.extend(
+            [
+                home / ".mentor_terminal_feedback.log",
+                home / "htb/session.log",
+            ]
+        )
     return [path for path in candidates if path.exists()]
 
 
 def filter_context_commands(commands: list[str], cwd: str, limit: int = HISTORY_CONTEXT_LIMIT) -> list[str]:
     cwd_path = Path(cwd).expanduser()
     cwd_name = cwd_path.name
+    candidate_homes = candidate_user_homes()
+    default_home = candidate_homes[0] if candidate_homes else Path.home()
 
     # Approximate shell state by tracking cd transitions.
     shell_dir = cwd_path
@@ -233,7 +303,7 @@ def filter_context_commands(commands: list[str], cwd: str, limit: int = HISTORY_
         if stripped.startswith("cd "):
             target = stripped[3:].strip().strip('"\'')
             if target in {"~", "$HOME"}:
-                shell_dir = Path.home()
+                shell_dir = default_home
             elif target.startswith("/"):
                 shell_dir = Path(target)
             else:
@@ -258,10 +328,10 @@ async def observe_history(cwd: str) -> AsyncIterator[HistoryEvent]:
         raise RuntimeError("watchfiles is required for asynchronous history stalking.")
 
     history_files = candidate_history_files()
-    if not history_files:
-        while True:
-            await asyncio.sleep(5)
-            yield HistoryEvent(command="", context_commands=[], trigger_brain=False)
+    while not history_files:
+        await asyncio.sleep(5)
+        yield HistoryEvent(command="", context_commands=[], trigger_brain=False)
+        history_files = candidate_history_files()
 
     target = history_files[0]
     feedback_files = candidate_feedback_files()
