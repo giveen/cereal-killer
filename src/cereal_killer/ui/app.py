@@ -190,8 +190,9 @@ class CerealKillerApp(App[None]):
                 dashboard.append_system(audit_warning, style="bold red")
                 self._append_chat("assistant", audit_warning)
 
-            if event.cd_target and event.cd_target != self.current_target:
-                auto_cmd = f"/box {event.cd_target}"
+            inferred_target = event.cd_target or event.host_target
+            if inferred_target and inferred_target != self.current_target:
+                auto_cmd = f"/box {inferred_target}"
                 cmd_result = await dispatch_command(auto_cmd, self.engine, self.kb.settings)
                 if cmd_result is not None:
                     await self._apply_command_result(cmd_result)

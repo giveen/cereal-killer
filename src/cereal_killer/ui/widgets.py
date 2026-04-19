@@ -56,10 +56,13 @@ class ThoughtBox(Collapsible):
 
     async def stream_thought(self, thought: str) -> None:
         content = thought.strip() or "(No <thought> output)"
+        # Model outputs sometimes include literal "\\n" sequences; normalize them
+        # so Markdown can wrap/display lines naturally.
+        content = content.replace("\\n", "\n")
         buffer: list[str] = []
         for line in content.splitlines() or [content]:
             buffer.append(line)
-            self._markdown().update(f"```text\n{'\\n'.join(buffer)}\n```")
+            self._markdown().update("\n".join(buffer))
             await asyncio.sleep(0.01)
 
 

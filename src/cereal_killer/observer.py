@@ -5,6 +5,7 @@ from mentor.observer.stalker import (
     HistoryEvent,
     candidate_history_files,
     detect_box_cd,
+    detect_box_host,
     detect_feedback_signal,
     filter_context_commands,
     is_technical_command,

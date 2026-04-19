@@ -51,6 +51,8 @@ class HistoryEvent:
     # Populated when the user `cd`s into a directory whose name looks like an
     # HTB machine so the UI can auto-trigger /box <name>.
     cd_target: str | None = None
+    # Populated when a command references a host like `cap.htb`.
+    host_target: str | None = None
 
 
 def candidate_history_files() -> list[Path]:
@@ -161,6 +163,7 @@ def detect_feedback_signal(text: str) -> str | None:
 # HTB machine names are 1-24 chars, letters/digits/hyphens, not all-digits,
 # and not common shell navigation tokens like '..', '-', '~', etc.
 _HTB_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{0,23}$")
+_HTB_HOST_RE = re.compile(r"\b([a-zA-Z][a-zA-Z0-9-]{0,23})\.htb\b", re.IGNORECASE)
 _SHELL_NAV_TOKENS = {"~", "-", "..", ".", "$HOME", "/", ""}
 
 
@@ -186,6 +189,16 @@ def detect_box_cd(command: str) -> str | None:
     name = target.split("/")[-1].split("\\")[-1]
     if _HTB_NAME_RE.match(name) and not name.isdigit():
         return name.lower()
+    return None
+
+
+def detect_box_host(command: str) -> str | None:
+    """Return a machine name when a command references a host like `cap.htb`."""
+    for match in _HTB_HOST_RE.finditer(command):
+        candidate = match.group(1).lower()
+        # Avoid common local aliases that are not HTB box names.
+        if candidate not in {"localhost", "local", "host", "gateway"}:
+            return candidate
     return None
 
 
@@ -360,6 +373,7 @@ async def observe_history(cwd: str) -> AsyncIterator[HistoryEvent]:
             feedback_signal = detect_feedback_signal(command)
             pending_json_hint_candidate = needs_structured_output_hint(command)
             cd_target = detect_box_cd(command)
+            host_target = detect_box_host(command)
             yield HistoryEvent(
                 command=command,
                 context_commands=context_commands,
@@ -367,4 +381,5 @@ async def observe_history(cwd: str) -> AsyncIterator[HistoryEvent]:
                 feedback_signal=feedback_signal,
                 feedback_line=command if feedback_signal else None,
                 cd_target=cd_target,
+                host_target=host_target,
             )

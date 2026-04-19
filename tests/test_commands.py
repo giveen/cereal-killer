@@ -11,7 +11,7 @@ from mentor.engine.commands import (
     is_slash_command,
     parse_slash_command,
 )
-from mentor.observer.stalker import detect_box_cd
+from mentor.observer.stalker import detect_box_cd, detect_box_host
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +164,20 @@ class DetectBoxCdTests(unittest.TestCase):
     def test_long_name_over_limit_ignored(self) -> None:
         long_name = "a" * 25  # > 24 chars
         self.assertIsNone(detect_box_cd(f"cd {long_name}"))
+
+
+class DetectBoxHostTests(unittest.TestCase):
+    def test_detects_machine_from_htb_hostname(self) -> None:
+        self.assertEqual(detect_box_host("nmap -sV cap.htb"), "cap")
+        self.assertEqual(detect_box_host("curl http://Falafel.htb/login"), "falafel")
+
+    def test_ignores_common_local_aliases(self) -> None:
+        self.assertIsNone(detect_box_host("curl http://localhost:8080"))
+        self.assertIsNone(detect_box_host("ping host.htb"))
+
+    def test_returns_none_when_no_htb_hostname(self) -> None:
+        self.assertIsNone(detect_box_host("nmap -sV 10.10.11.20"))
+        self.assertIsNone(detect_box_host("ls -la"))
 
 
 if __name__ == "__main__":
