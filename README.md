@@ -2,6 +2,22 @@
 
 `cereal-killer` is a terminal UI assistant for box-style workflow coaching. It watches command history, tracks phase progress, and provides guidance through a local OpenAI-compatible LLM, Redis-backed context, and optional web fallback search.
 
+## Table of Contents
+
+- [Quickstart](#quickstart)
+- [What It Does](#what-it-does)
+- [Features](#features)
+- [Configuration](#configuration)
+- [Usage](#usage)
+- [Data Sync](#data-sync)
+- [Docker Commands](#docker-commands)
+- [Project Structure](#project-structure)
+- [Development](#development)
+- [Testing](#testing)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
+- [License](#license)
+
 ## Quickstart
 
 ### Option A: Docker Compose (recommended)
@@ -78,15 +94,19 @@ python -m cereal_killer.main
 
 Use environment variables (from `.env` in Docker or your shell locally):
 
+- `REDIS_URL` (default `redis://localhost:6379`)
+- `REDIS_INDEX` (default `ippsec_idx`)
 - `LLM_BASE_URL` (default `http://host.docker.internal:8000/v1`)
 - `LLM_MODEL` (default `qwen3.6`)
 - `LLM_API_KEY` (default `not-needed`)
 - `REASONING_PARSER` (default `qwen3`)
 - `MAX_MODEL_LEN` (default `262144`)
+- `SEARXNG_BASE_URL` (default `http://localhost:18080`)
+- `SEARXNG_VECTOR_THRESHOLD` (default `0.7`)
 
 Template file: `.env.example`
 
-Redis and SearXNG settings are intentionally not exposed in the default template. The Docker stack provides sane internal defaults, and most users should leave those unchanged.
+The default `.env.example` focuses on model settings. Redis and SearXNG defaults are already defined in application config and Make targets.
 
 For external LLM hosts, set `LLM_BASE_URL` to a reachable IP or DNS name, for example `http://192.168.1.50:8000/v1`.
 
@@ -108,20 +128,8 @@ Useful slash commands:
 Keyboard shortcuts:
 
 - `Ctrl+C`: quit
-- `Ctrl+Y`: copy last code block
 - `Ctrl+T`: toggle thinking panel
-- `Ctrl+S`: vision capture
 - `Ctrl+B`: Easy button pulse
-
-## Docker Commands
-
-- `make docker-build`: build service images
-- `make docker-up`: build and start Redis + SearXNG in the background
-- `make tui`: launch the Textual app locally (expects `cereal-killer` to be installed)
-- `make docker-down`: stop and remove the stack
-
-These Make targets enable Docker BuildKit by default, so package download/build caches are reused across rebuilds for faster iteration.
-`make docker-up` intentionally does not attach to the app container. This avoids compose log-prefix interference in fullscreen TUI rendering.
 
 ## Example Workflow
 
@@ -134,7 +142,15 @@ These Make targets enable Docker BuildKit by default, so package download/build 
 
 ## Data Sync
 
-To sync the IppSec dataset into Redis:
+No local virtual environment is required if you use Docker:
+
+```bash
+make sync-ippsec
+```
+
+This runs the sync inside the app container.
+
+To sync from your host Python environment instead:
 
 ```bash
 python scripts/sync_ippsec.py
@@ -146,10 +162,29 @@ Or via the installed console script:
 sync-ippsec
 ```
 
+If you run the sync command from the host while Redis is started via Docker, use:
+
+```bash
+REDIS_URL=redis://localhost:6379 python scripts/sync_ippsec.py
+```
+
+## Docker Commands
+
+- `make docker-build`: build service images
+- `make docker-up`: build and start Redis + SearXNG in the background
+- `make tui`: launch the Textual app locally (expects `cereal-killer` to be installed)
+- `make docker-down`: stop and remove the stack
+
+These Make targets enable Docker BuildKit by default, so package download/build caches are reused across rebuilds for faster iteration.
+`make docker-up` intentionally does not attach to the app container. This avoids compose log-prefix interference in fullscreen TUI rendering.
+
 ## Project Structure
 
 - `src/cereal_killer/main.py`: app entrypoint
-- `src/cereal_killer/ui.py`: Textual dashboard and interaction flow
+- `src/cereal_killer/ui/app.py`: Textual app controller and message routing
+- `src/cereal_killer/ui/screens.py`: dashboard and modal screens
+- `src/cereal_killer/ui/widgets.py`: custom UI widgets
+- `src/cereal_killer/ui/styles.tcss`: Textual stylesheet
 - `src/cereal_killer/engine.py`: LLM integration and session orchestration
 - `src/cereal_killer/knowledge_base.py`: RedisVL index and dataset sync
 - `src/cereal_killer/observer.py`: history observer integration

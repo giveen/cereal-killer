@@ -1,4 +1,4 @@
-.PHONY: docker-build docker-up docker-down tui
+.PHONY: docker-build docker-up docker-down tui sync-ippsec
 
 DOCKER_BUILDKIT ?= 1
 COMPOSE_DOCKER_CLI_BUILD ?= 1
@@ -30,3 +30,6 @@ tui:
 
 docker-down:
 	docker compose down
+
+sync-ippsec:
+	docker compose run --rm app python scripts/sync_ippsec.py
