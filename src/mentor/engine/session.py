@@ -141,6 +141,32 @@ class ThinkingSessionStore:
         except Exception:
             return
 
+    async def clear_thoughts(self, machine_name: str) -> None:
+        """Delete only the rolling thoughts buffer for this machine."""
+        client = await self._client()
+        if client is None:
+            return
+        try:
+            await client.delete(self._key(machine_name))
+        except Exception:
+            return
+
+    async def replace_thoughts(self, machine_name: str, summary: str) -> None:
+        """Replace the thoughts buffer with a single summary entry."""
+        client = await self._client()
+        if client is None:
+            return
+        clean = summary.strip()
+        if not clean:
+            return
+        key = self._key(machine_name)
+        try:
+            await client.delete(key)
+            await client.rpush(key, clean)
+            await client.expire(key, 60 * 60 * 24 * 7)
+        except Exception:
+            return
+
     # ------------------------------------------------------------------
     # User learnings vault  (key: user_learnings:<machine>)
     # ------------------------------------------------------------------

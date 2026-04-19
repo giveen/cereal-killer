@@ -2,6 +2,7 @@ import unittest
 
 from cereal_killer.config import Settings
 from cereal_killer.engine import LLMEngine, parse_llm_response
+from mentor.engine.brain import Brain
 
 
 class ParseLLMResponseTests(unittest.TestCase):
@@ -39,6 +40,39 @@ class PruneThresholdTests(unittest.TestCase):
         settings = Settings(max_model_len=262144)
         engine = LLMEngine(settings)
         self.assertGreater(engine.prune_threshold(), engine.prune_target())
+
+
+class BrainContextHelpersTests(unittest.TestCase):
+    def test_dedupe_messages_removes_consecutive_duplicates(self) -> None:
+        messages = [
+            {"role": "system", "content": "A"},
+            {"role": "system", "content": "A"},
+            {"role": "assistant", "content": "", "reasoning_content": "r"},
+            {"role": "assistant", "content": "", "reasoning_content": "r"},
+            {"role": "user", "content": "u"},
+        ]
+        deduped = Brain._dedupe_messages(messages)
+        self.assertEqual(len(deduped), 3)
+        self.assertEqual(deduped[0]["role"], "system")
+        self.assertEqual(deduped[1]["role"], "assistant")
+        self.assertEqual(deduped[2]["role"], "user")
+
+    def test_similar_input_detects_variations(self) -> None:
+        self.assertTrue(
+            Brain._is_similar_input(
+                "curl 'http://10.10.11.35/ip?ip=1.1.1.1;id'",
+                "curl http://10.10.11.35/ip?ip=1.1.1.1; whoami",
+            )
+        )
+
+    def test_stuck_status_prefers_ip_command_injection_message(self) -> None:
+        status = Brain._build_stuck_status(
+            [
+                "Trying command injection on /ip parameter",
+                "Still testing command injection on ip",
+            ]
+        )
+        self.assertIn("/ip parameter", status)
 
 
 if __name__ == "__main__":

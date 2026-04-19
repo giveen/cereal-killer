@@ -4,6 +4,7 @@ import base64
 import mimetypes
 import os
 import re
+import hashlib
 from datetime import UTC, datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +56,7 @@ class BrainResponse:
 
 class Brain:
     COMMAND_CONTEXT_LIMIT = 20
+    STUCK_TURN_LIMIT = 5
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -67,6 +69,10 @@ class Brain:
         # Socratic state machine — tracks how long the user has been stuck.
         self._pedagogy = PedagogyEngine()
         self._session = ThinkingSessionStore(settings)
+        self._stalled_turns = 0
+        self._last_progress_signature = ""
+        self._recent_user_inputs: list[str] = []
+        self._last_user_input = ""
         self._client: Any | None = None
         if AsyncOpenAI is not None:
             self._client = AsyncOpenAI(base_url=settings.llm_base_url, api_key=settings.llm_api_key)
@@ -99,9 +105,35 @@ class Brain:
     ) -> BrainResponse:
         history_commands = history_commands or []
         machine_name = Path.cwd().name
-        context_block = "\n".join(f"- {cmd}" for cmd in history_commands[-self.COMMAND_CONTEXT_LIMIT:])
+        historical_commands = history_commands[-self.COMMAND_CONTEXT_LIMIT:]
+        latest_input = (tool_command or user_prompt).strip()
+        context_block = "\n".join(f"- {cmd}" for cmd in historical_commands)
         minified_tool_output = minify_terminal_output(tool_output or "", command=tool_command)
         previous_reasoning = await self._session.thinking_buffer(machine_name)
+
+        thinking_flush = bool(re.search(r"\bwhat\s+am\s+i\s+doing\s+wrong\b", user_prompt, re.IGNORECASE))
+        if thinking_flush:
+            await self._session.clear_thoughts(machine_name)
+            previous_reasoning = ""
+
+        progress_signature = self._progress_signature(historical_commands)
+        if progress_signature != self._last_progress_signature:
+            self._stalled_turns = 0
+            self._recent_user_inputs = []
+            self._last_progress_signature = progress_signature
+        else:
+            self._stalled_turns += 1
+
+        if latest_input:
+            self._recent_user_inputs.append(latest_input)
+            if len(self._recent_user_inputs) > self.STUCK_TURN_LIMIT:
+                self._recent_user_inputs = self._recent_user_inputs[-self.STUCK_TURN_LIMIT:]
+
+        if self._stalled_turns >= self.STUCK_TURN_LIMIT:
+            stuck_summary = self._build_stuck_status(self._recent_user_inputs)
+            await self._session.replace_thoughts(machine_name, stuck_summary)
+            previous_reasoning = stuck_summary
+            self._stalled_turns = 0
 
         # --- Tiered search: Redis VDB first, SearXNG as last resort -----
         # Web search is only enabled when pedagogy reaches DIRECT level.
@@ -125,18 +157,41 @@ class Brain:
         addendum_block = f"{self.system_prompt_addendum}\n\n" if self.system_prompt_addendum else ""
         web_addendum = f"{_WEB_SEARCH_ADDENDUM}\n\n" if search_result.used_web else ""
         pedagogy_block = f"{self._pedagogy.system_prompt_addendum()}\n\n"
+        similarity_note = ""
+        if self._is_similar_input(latest_input, self._last_user_input):
+            similarity_note = (
+                "The latest user input is a variation of a previous failed attempt. "
+                "Notice the user tried a new variation and failed; provide a different hint.\n\n"
+            )
+        flush_note = ""
+        if thinking_flush:
+            flush_note = (
+                "THINKING FLUSH: The user asked what they are doing wrong. "
+                "Re-evaluate the methodology from scratch and do not rely on prior stale reasoning.\n\n"
+            )
         system_prompt = (
             f"{self.system_prompt}\n\n"
             f"{self._abrasive_prompt_addendum(pathetic_meter)}\n\n"
             f"{pedagogy_block}"
             f"{addendum_block}"
             f"{web_addendum}"
+            f"{similarity_note}"
+            f"{flush_note}"
             f"{reference_material}"
         )
 
+        failure_note = ""
+        if re.search(r"\b404\b|not\s+found", minified_tool_output, re.IGNORECASE):
+            failure_note = (
+                f"The user just tried: {latest_input}. It resulted in a 404/Not Found. "
+                "Analyze why THIS specific attempt failed compared to the previous ones.\n\n"
+            )
+
         user_message = (
             f"Thinking buffer from previous reasoning for this machine:\n{previous_reasoning or '- none'}\n\n"
-            f"Recent shell command context:\n{context_block or '- none'}\n\n"
+            f"Latest Command/Input:\n{latest_input or '- none'}\n\n"
+            f"Historical Commands:\n{context_block or '- none'}\n\n"
+            f"{failure_note}"
             f"Minified tool output:\n{minified_tool_output or '- none'}\n\n"
             f"User prompt:\n{user_prompt}"
         )
@@ -148,6 +203,8 @@ class Brain:
             messages.append({"role": "assistant", "content": "", "reasoning_content": previous_reasoning})
         messages.append({"role": "user", "content": user_message})
 
+        messages = self._dedupe_messages(messages)
+
         content, reasoning_content = await self._chat_completion(
             machine_name=machine_name,
             messages=messages,
@@ -156,6 +213,7 @@ class Brain:
         persisted_reasoning = reasoning_content.strip() or parsed.thought
         if persisted_reasoning:
             await self._session.append_thought(machine_name, persisted_reasoning)
+        self._last_user_input = latest_input
         return BrainResponse(
             thought=parsed.thought,
             answer=parsed.answer,
@@ -309,6 +367,8 @@ class Brain:
             }
         )
 
+        messages = self._dedupe_messages(messages)
+
         completion = await self._client.chat.completions.create(
             model=self.settings.llm_model,
             messages=messages,
@@ -405,6 +465,58 @@ class Brain:
             if any(tool in command.lower() for tool in ("nmap", "masscan", "gobuster", "feroxbuster", "nikto")):
                 return f"your recent recon command: {command[:120]}"
         return "your last recon trail"
+
+    @staticmethod
+    def _progress_signature(history_commands: list[str]) -> str:
+        """Stable signature of recent command context to detect progress changes."""
+        joined = "\n".join(history_commands[-5:])
+        if not joined:
+            return ""
+        return hashlib.sha256(joined.encode("utf-8", errors="ignore")).hexdigest()
+
+    @staticmethod
+    def _dedupe_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop consecutive duplicate role/content blocks before sending to the LLM."""
+        deduped: list[dict[str, Any]] = []
+        prev_key: tuple[str, str, str] | None = None
+        for msg in messages:
+            role = str(msg.get("role", ""))
+            content = str(msg.get("content", ""))
+            reasoning = str(msg.get("reasoning_content", ""))
+            key = (role, content, reasoning)
+            if key == prev_key:
+                continue
+            deduped.append(msg)
+            prev_key = key
+        return deduped
+
+    @staticmethod
+    def _is_similar_input(current: str, previous: str) -> bool:
+        if not current or not previous:
+            return False
+        norm_cur = re.sub(r"[^a-z0-9]+", " ", current.strip().lower())
+        norm_prev = re.sub(r"[^a-z0-9]+", " ", previous.strip().lower())
+        norm_cur = re.sub(r"\s+", " ", norm_cur).strip()
+        norm_prev = re.sub(r"\s+", " ", norm_prev).strip()
+        if norm_cur == norm_prev:
+            return True
+        cur_tokens = set(norm_cur.split())
+        prev_tokens = set(norm_prev.split())
+        if not cur_tokens or not prev_tokens:
+            return False
+        overlap = len(cur_tokens & prev_tokens) / max(1, len(cur_tokens | prev_tokens))
+        return overlap >= 0.60
+
+    @staticmethod
+    def _build_stuck_status(recent_inputs: list[str]) -> str:
+        blob = " ".join(recent_inputs).lower()
+        if "command injection" in blob and ("/ip" in blob or " ip " in blob or "ip parameter" in blob):
+            return "Status: User is stuck on command injection in the /ip parameter"
+        if "command injection" in blob:
+            return "Status: User is stuck on command injection attempts"
+        if "/ip" in blob or "ip parameter" in blob:
+            return "Status: User is stuck on the /ip parameter behavior"
+        return "Status: User is stuck; prior hints did not produce progress"
 
     @staticmethod
     def _file_to_data_uri(image_path: str) -> str:
