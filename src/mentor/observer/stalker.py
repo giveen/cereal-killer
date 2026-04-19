@@ -129,7 +129,7 @@ class HistoryStalker:
             return
         ask_fn: Callable[..., Awaitable[Any]] | None = getattr(self.brain, "ask", None)
         if ask_fn is not None:
-            prompt = f"Observed command in {cwd}:\n{command}\n\nRecent context:\n" + "\n".join(context[-self.context_limit :])
+            prompt = f"Observed command in {cwd}:\n{command}\n\nRecent context:\n" + "\n".join(context)
             await ask_fn(prompt=prompt)
 
     async def _handle_lines(self, lines: list[str]) -> None:

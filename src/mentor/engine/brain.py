@@ -46,7 +46,12 @@ class Brain:
         on_thoughts: Callable[[Sequence[str]], Any] | None = None,
     ) -> None:
         self.model = model
-        self.base_url = base_url or os.getenv("MENTOR_OPENAI_BASE_URL", "http://127.0.0.1:8000/v1")
+        self.base_url = (
+            base_url
+            or os.getenv("MENTOR_API_BASE_URL")
+            or os.getenv("MENTOR_OPENAI_BASE_URL")
+            or "http://127.0.0.1:8000/v1"
+        )
         self.api_key = api_key or os.getenv("OPENAI_API_KEY", "local")
         self.use_litellm = use_litellm
         self.system_prompt = system_prompt
@@ -124,4 +129,3 @@ class Brain:
 
 
 __all__ = ["Brain", "BrainResponse", "OLDER_ZERO_COOL_PROMPT"]
-
