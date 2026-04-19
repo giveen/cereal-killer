@@ -127,16 +127,20 @@ class CerealKillerApp(App[None]):
             dashboard.append_system(f"LLM error: {exc}", style="red")
             dashboard.set_active_tool("Idle")
             return
-        await dashboard.stream_thought(response.reasoning_content or response.thought)
-        self._track_code_block(response.answer)
-        self._warn_if_repetitive_response(response.answer)
-        self._append_chat("assistant", response.answer)
-        dashboard.append_assistant(response.answer)
-        phase = detect_phase(self.history_context)
-        dashboard.set_phase(phase)
-        if "pwned" in prompt.lower() or "owned" in prompt.lower():
-            self._save_session_snapshot("pwned-manual")
-        dashboard.set_active_tool("Idle")
+        try:
+            await self._safe_stream_thought(response.reasoning_content or response.thought)
+            self._track_code_block(response.answer)
+            self._warn_if_repetitive_response(response.answer)
+            self._append_chat("assistant", response.answer)
+            dashboard.append_assistant(response.answer)
+            phase = detect_phase(self.history_context)
+            dashboard.set_phase(phase)
+            if "pwned" in prompt.lower() or "owned" in prompt.lower():
+                self._save_session_snapshot("pwned-manual")
+        except Exception as exc:
+            dashboard.append_system(f"UI post-processing error: {exc}", style="red")
+        finally:
+            dashboard.set_active_tool("Idle")
 
     async def _handle_loot_report(self) -> None:
         dashboard = self._dashboard()
@@ -150,10 +154,13 @@ class CerealKillerApp(App[None]):
         except Exception as exc:
             dashboard.append_system(f"Loot report error: {exc}", style="red")
             return
-        await dashboard.stream_thought(response.reasoning_content or response.thought)
-        self._warn_if_repetitive_response(response.answer)
-        dashboard.append_assistant(response.answer)
-        self._append_chat("assistant", response.answer)
+        try:
+            await self._safe_stream_thought(response.reasoning_content or response.thought)
+            self._warn_if_repetitive_response(response.answer)
+            dashboard.append_assistant(response.answer)
+            self._append_chat("assistant", response.answer)
+        except Exception as exc:
+            dashboard.append_system(f"Loot report UI error: {exc}", style="red")
 
     async def _run_boot_sequence(self) -> None:
         dashboard = self._dashboard()
@@ -219,12 +226,16 @@ class CerealKillerApp(App[None]):
                 dashboard.set_active_tool("Idle")
                 continue
 
-            await dashboard.stream_thought(response.reasoning_content or response.thought)
-            self._warn_if_repetitive_response(response.answer)
-            self._append_chat("assistant", response.answer)
-            self._track_code_block(response.answer)
-            dashboard.append_assistant(response.answer)
-            dashboard.set_active_tool("Idle")
+            try:
+                await self._safe_stream_thought(response.reasoning_content or response.thought)
+                self._warn_if_repetitive_response(response.answer)
+                self._append_chat("assistant", response.answer)
+                self._track_code_block(response.answer)
+                dashboard.append_assistant(response.answer)
+            except Exception as exc:
+                dashboard.append_system(f"Auto-coach UI error: {exc}", style="red")
+            finally:
+                dashboard.set_active_tool("Idle")
 
     def _on_web_search_state(self, active: bool) -> None:
         dashboard = self._dashboard()
@@ -238,15 +249,23 @@ class CerealKillerApp(App[None]):
         self.push_screen(SolutionModal(solution_markdown))
 
     def action_pulse_easy_button(self) -> None:
-        easy_button = self._dashboard().query_one("#easy_button", PulsingEasyButton)
+        easy_button = self._get_easy_button()
+        if easy_button is None:
+            return
         easy_button.pulse_once()
 
     def _pulse_easy_button(self) -> None:
-        try:
-            easy_button = self._dashboard().query_one("#easy_button", PulsingEasyButton)
-        except NoMatches:
+        easy_button = self._get_easy_button()
+        if easy_button is None:
             return
         easy_button.pulse_once()
+
+    def _get_easy_button(self) -> PulsingEasyButton | None:
+        """Return the easy button when the dashboard is active, else None."""
+        try:
+            return self._dashboard().query_one("#easy_button", PulsingEasyButton)
+        except (RuntimeError, NoMatches):
+            return None
 
     async def _apply_command_result(self, result: CommandResult) -> None:
         dashboard = self._dashboard()
@@ -335,6 +354,20 @@ class CerealKillerApp(App[None]):
                 title="Repetition Warning",
                 severity="warning",
             )
+
+    async def _safe_stream_thought(self, thought: str) -> None:
+        """Best-effort thought streaming with backward-compatible fallbacks."""
+        dashboard = self._dashboard()
+        stream_method = getattr(dashboard, "stream_thought", None)
+        if callable(stream_method):
+            await stream_method(thought)
+            return
+        # Backward compatibility with older dashboard implementations.
+        thought_box_method = getattr(dashboard, "thought_box", None)
+        if callable(thought_box_method):
+            thought_box = thought_box_method()
+            if thought_box is not None and hasattr(thought_box, "stream_thought"):
+                await thought_box.stream_thought(thought)
 
     def _track_code_block(self, response_text: str) -> None:
         matches = CODE_BLOCK_PATTERN.findall(response_text)

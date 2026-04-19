@@ -30,7 +30,7 @@ class VerticalProgressBar(Static):
 
 
 class PulsingEasyButton(Button):
-    def __init__(self, label: str = "EASY", id: str | None = "easy_button") -> None:
+    def __init__(self, label: str = "Easy Button", id: str | None = "easy_button") -> None:
         super().__init__(label, id=id)
         self.add_class("easy-pulse")
 
