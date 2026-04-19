@@ -36,8 +36,18 @@ cp .env.example .env
 ```bash
 make docker-build
 make docker-up
+make sync-ippsec
 make tui
 ```
+
+Workflow order for first run:
+
+1. `make docker-build`
+2. `make docker-up`
+3. `make sync-ippsec`
+4. `make tui`
+
+Note: the sync target is named `make sync-ippsec`.
 
 Or run directly with Docker Compose:
 
@@ -113,6 +123,15 @@ For external LLM hosts, set `LLM_BASE_URL` to a reachable IP or DNS name, for ex
 ## Usage
 
 After launch, use the prompt input in the TUI and run commands in your shell as usual.
+
+Recommended startup flow:
+
+```bash
+make docker-build
+make docker-up
+make sync-ippsec
+make tui
+```
 
 Useful slash commands:
 
