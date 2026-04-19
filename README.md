@@ -36,17 +36,20 @@ cp .env.example .env
 
 ```bash
 make docker-build
-make docker-up
-make sync-ippsec
-make tui
+make docker-up-init
+make
 ```
 
 Workflow order for first run:
 
 1. `make docker-build`
-2. `make docker-up`
-3. `make sync-ippsec`
-4. `make tui`
+2. `make docker-up-init`
+3. `make` (or `make run`)
+
+Manual alternative:
+
+1. `make docker-up`
+2. `make sync-ippsec`
 
 Note: the sync target is named `make sync-ippsec`.
 
@@ -61,7 +64,7 @@ This starts:
 - `redis` (Redis Stack)
 - `searxng` (optional web search backend used as last resort)
 
-Then `make tui` (or `cereal-killer`) launches the Textual UI from your host shell.
+Then `make` (or `make run`, `make tui`, or `cereal-killer`) launches the Textual UI from your host shell.
 
 SearXNG is exposed on `http://localhost:18080`.
 
@@ -121,6 +124,11 @@ The default `.env.example` focuses on model settings. Redis and SearXNG defaults
 
 For external LLM hosts, set `LLM_BASE_URL` to a reachable IP or DNS name, for example `http://192.168.1.50:8000/v1`.
 
+Runtime note:
+
+- `make docker-build` rebuilds images only; it does not by itself change a currently running host process.
+- `make` / `make run` / `make tui` load `.env` before launching, so updated values (like `LLM_BASE_URL`) are applied on next launch.
+
 ## Model Recommendations by VRAM
 
 If you are using models from https://huggingface.co/HauhauCS/models, choose by available VRAM first.
@@ -145,9 +153,8 @@ Recommended startup flow:
 
 ```bash
 make docker-build
-make docker-up
-make sync-ippsec
-make tui
+make docker-up-init
+make
 ```
 
 Useful slash commands:
@@ -209,7 +216,8 @@ REDIS_URL=redis://localhost:6379 python scripts/sync_ippsec.py
 
 - `make docker-build`: build service images
 - `make docker-up`: build and start Redis + SearXNG in the background
-- `make tui`: launch the Textual app (uses local install if available, otherwise falls back to `docker compose run --rm --build app cereal-killer`)
+- `make docker-up-init`: run `make docker-up`, then auto-run sync only if `ippsec_idx` is missing
+- `make` / `make run` / `make tui`: launch the Textual app (uses local install if available, otherwise falls back to `docker compose run --rm --build app cereal-killer`)
 - `make docker-down`: stop and remove the stack
 
 These Make targets enable Docker BuildKit by default, so package download/build caches are reused across rebuilds for faster iteration.

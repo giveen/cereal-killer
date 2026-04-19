@@ -1,4 +1,6 @@
-.PHONY: docker-build docker-up docker-down tui sync-ippsec
+.PHONY: docker-build docker-up docker-up-init docker-down tui run start sync-ippsec
+
+.DEFAULT_GOAL := tui
 
 DOCKER_BUILDKIT ?= 1
 COMPOSE_DOCKER_CLI_BUILD ?= 1
@@ -12,13 +14,24 @@ docker-build:
 docker-up:
 	docker compose up -d --build redis searxng
 
+docker-up-init: docker-up
+	@INDEX="$${REDIS_INDEX:-ippsec_idx}"; \
+	if docker compose exec -T redis redis-cli FT._LIST 2>/dev/null | tr -d '\r' | grep -Fxq "$$INDEX"; then \
+		echo "Redis index '$$INDEX' already exists; skipping sync."; \
+	else \
+		echo "Redis index '$$INDEX' not found; running sync-ippsec..."; \
+		$(MAKE) sync-ippsec; \
+	fi
+
 tui:
 	@if command -v cereal-killer >/dev/null 2>&1; then \
+		set -a; [ -f .env ] && . ./.env; set +a; \
 		REDIS_URL="$${REDIS_URL:-redis://localhost:6379}" \
 		SEARXNG_BASE_URL="$${SEARXNG_BASE_URL:-http://localhost:18080}" \
 		LLM_BASE_URL="$${LLM_BASE_URL:-http://localhost:8000/v1}" \
 		cereal-killer; \
 	elif [ -x .venv/bin/cereal-killer ]; then \
+		set -a; [ -f .env ] && . ./.env; set +a; \
 		REDIS_URL="$${REDIS_URL:-redis://localhost:6379}" \
 		SEARXNG_BASE_URL="$${SEARXNG_BASE_URL:-http://localhost:18080}" \
 		LLM_BASE_URL="$${LLM_BASE_URL:-http://localhost:8000/v1}" \
@@ -27,6 +40,10 @@ tui:
 		echo "No local cereal-killer install found. Launching via Docker app service..."; \
 		docker compose run --rm --build app cereal-killer; \
 	fi
+
+run: tui
+
+start: tui
 
 docker-down:
 	docker compose down --remove-orphans
