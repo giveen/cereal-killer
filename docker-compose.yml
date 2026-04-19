@@ -1,0 +1,25 @@
+services:
+  app:
+    build: .
+    depends_on:
+      - redis
+    environment:
+      REDIS_URL: redis://redis:6379
+      REDIS_INDEX: ippsec_idx
+      LLM_BASE_URL: http://host.docker.internal:8000/v1
+      LLM_MODEL: qwen3.6
+      LLM_API_KEY: not-needed
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ~/.zsh_history:/root/.zsh_history:ro
+      - ~/.bash_history:/root/.bash_history:ro
+      - ~/.local/share/fish/fish_history:/root/.local/share/fish/fish_history:ro
+    tty: true
+    stdin_open: true
+
+  redis:
+    image: redis/redis-stack:latest
+    ports:
+      - "6379:6379"
+      - "8001:8001"
