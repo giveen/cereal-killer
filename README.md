@@ -200,12 +200,19 @@ These Make targets enable Docker BuildKit by default, so package download/build 
 
 Redis persistence:
 
-- Redis data is stored in a named Docker volume (`redis_data`).
+- Redis data is stored in a stable named Docker volume (`cereal-killer-redis-data`).
 - This means `make docker-down`, `git pull`, and `make docker-build` do not wipe indexed data.
 - To intentionally reset Redis data, run:
 
 ```bash
 docker compose down -v
+```
+
+Quick verify:
+
+```bash
+docker volume ls | grep cereal-killer-redis-data
+docker compose exec -T redis redis-cli FT._LIST
 ```
 
 ## Project Structure

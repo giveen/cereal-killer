@@ -156,6 +156,15 @@ async def _check_ippsec_dataset(settings: Settings) -> CheckResult:
             ),
         )
     except Exception as exc:
+        if "Unknown index name" in str(exc):
+            return CheckResult(
+                label="IppSec",
+                ok=False,
+                message=(
+                    "[yellow][WARN][/yellow] [b]IppSec dataset[/b] — index not found yet. "
+                    "Run make sync-ippsec to initialize and persist it."
+                ),
+            )
         return CheckResult(
             label="IppSec",
             ok=False,
