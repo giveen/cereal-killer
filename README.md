@@ -8,6 +8,7 @@
 - [What It Does](#what-it-does)
 - [Features](#features)
 - [Configuration](#configuration)
+- [Model Recommendations by VRAM](#model-recommendations-by-vram)
 - [Usage](#usage)
 - [Data Sync](#data-sync)
 - [Docker Commands](#docker-commands)
@@ -119,6 +120,22 @@ Template file: `.env.example`
 The default `.env.example` focuses on model settings. Redis and SearXNG defaults are already defined in application config and Make targets.
 
 For external LLM hosts, set `LLM_BASE_URL` to a reachable IP or DNS name, for example `http://192.168.1.50:8000/v1`.
+
+## Model Recommendations by VRAM
+
+If you are using models from https://huggingface.co/HauhauCS/models, choose by available VRAM first.
+
+These are practical targets for this app:
+
+- 8 GB to 12 GB VRAM: prefer Geema4/Gemma-4 5B class models (for example `Gemma-4-E2B-Uncensored-HauhauCS-Aggressive`). This is the safest starting point when you need responsiveness over deep reasoning.
+- 12 GB to 16 GB VRAM: prefer Geema4/Gemma-4 8B class models (for example `Gemma-4-E4B-Uncensored-HauhauCS-Aggressive`). Good balance for everyday box workflow coaching.
+- 24 GB or more VRAM: prefer Qwen3.6 35B-A3B class models (for example `Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive`). Best option from this set when you want stronger reasoning and longer-context quality.
+
+Notes:
+
+- Start one tier lower if you see frequent OOM or heavy token latency.
+- Keep `LLM_MODEL` in `.env` aligned with the model name your OpenAI-compatible server exposes.
+- If your server supports quantized variants, lower-bit quantization can reduce VRAM usage at some quality cost.
 
 ## Usage
 
