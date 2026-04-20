@@ -7,7 +7,9 @@ from pathlib import Path
 
 from textual.containers import Horizontal, Vertical
 from textual import on
+from textual.message import Message
 from textual.widgets import Button, Collapsible, Input, Markdown, Static
+from textual.widgets import TextArea
 
 try:
     from PIL import Image
@@ -56,11 +58,21 @@ class PulsingEasyButton(Button):
         self.app.call_after_refresh(lambda: self.add_class("easy-flash"))
 
 
-class CommandInput(Input):
-    BINDINGS = [("ctrl+v", "paste_clipboard", "Paste")]
+class CommandInput(TextArea):
+    BINDINGS = [
+        ("ctrl+enter", "submit", "Send"),
+        ("ctrl+v", "paste_clipboard", "Paste"),
+    ]
+
+    class Submitted(Message):
+        def __init__(self, input_widget: "CommandInput", value: str) -> None:
+            self.input = input_widget
+            self.value = value
+            super().__init__()
 
     def __init__(self) -> None:
-        super().__init__(placeholder="Type /box or ask Zero Cool...", id="command_input")
+        super().__init__(text="", id="command_input")
+        self.border_title = "Prompt (Enter=new line, Ctrl+Enter=send)"
 
     def action_paste_clipboard(self) -> None:
         """Read system clipboard and insert text at current cursor position."""
@@ -68,14 +80,15 @@ class CommandInput(Input):
         text = read_text()
         if not text:
             return
-        # Strip newlines so a multi-line clipboard entry becomes one line.
-        cleaned = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip()
-        if not cleaned:
+        # TextArea insert keeps multiline payloads intact.
+        self.insert(text)
+
+    def action_submit(self) -> None:
+        prompt = self.text.strip()
+        if not prompt:
             return
-        # Insert at cursor: splice into current value.
-        pos = self.cursor_position
-        self.value = self.value[:pos] + cleaned + self.value[pos:]
-        self.cursor_position = pos + len(cleaned)
+        self.post_message(self.Submitted(self, prompt))
+        self.text = ""
 
 
 class ChatMessage(Static):

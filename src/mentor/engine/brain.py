@@ -495,6 +495,21 @@ class Brain:
             message.content or "",
             getattr(message, "reasoning_content", "") or "",
         )
+        if not content.strip() and not reasoning.strip():
+            self._backend_trace(
+                event="error",
+                trace_id=trace_id,
+                provider="openai-client",
+                machine=machine_name,
+                payload={
+                    "error": "Empty completion payload",
+                    "hint": "Backend returned no content/reasoning_content; verify model output format and REASONING_PARSER",
+                },
+            )
+            content = (
+                "No response text returned by backend. "
+                "Check llama-swap/router logs and set REASONING_PARSER=qwen3."
+            )
         return content, reasoning, metrics
 
     async def _chat_completion_with_image(

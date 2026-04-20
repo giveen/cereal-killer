@@ -26,6 +26,31 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 
+def _normalise_reasoning_parser(raw_value: str) -> str:
+    """Keep reasoning parser values backend-compatible.
+
+    Users sometimes paste model names into REASONING_PARSER. Fall back to qwen3
+    when the value clearly looks like a model identifier instead of a parser key.
+    """
+    value = (raw_value or "").strip().strip('"').strip("'")
+    if not value:
+        return "qwen3"
+
+    lowered = value.lower()
+    if lowered in {"qwen3", "qwen", "qwen-3"}:
+        return "qwen3"
+
+    looks_like_model_name = (
+        any(token in lowered for token in {"uncensored", "instruct", "gguf", "a3b", "b-instruct"})
+        or ("qwen" in lowered and any(ch.isdigit() for ch in lowered))
+        or any(ch in value for ch in {"/", " ", ":"})
+    )
+    if looks_like_model_name:
+        return "qwen3"
+
+    return value
+
+
 @dataclass(slots=True)
 class Settings:
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -37,7 +62,7 @@ class Settings:
     llm_model: str = os.getenv("LLM_MODEL", "qwen3.6")
     llm_vision_model: str = os.getenv("LLM_VISION_MODEL", "")
     github_token: str = os.getenv("GITHUB_TOKEN", "")
-    reasoning_parser: str = os.getenv("REASONING_PARSER", "qwen3")
+    reasoning_parser: str = _normalise_reasoning_parser(os.getenv("REASONING_PARSER", "qwen3"))
     # Disable backend thought preservation by default to avoid leaking internal context.
     preserve_thinking: bool = os.getenv("PRESERVE_THINKING", "0").lower() in {
         "1",

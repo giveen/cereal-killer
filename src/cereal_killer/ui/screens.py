@@ -599,7 +599,7 @@ class MainDashboard(Screen[None]):
         self.query_one("#gibson_search_input", Input).focus()
 
     def focus_chat_input(self) -> None:
-        self.query_one("#command_input", Input).focus()
+        self.query_one("#command_input").focus()
 
     @staticmethod
     def _set_tab_states(tab_chat: Button, tab_ops: Button, tab_gibson: Button, *, active: str) -> None:

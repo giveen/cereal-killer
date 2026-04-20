@@ -43,6 +43,7 @@ from mentor.ui.startup import run_boot_sequence
 from .screens import InfrastructureCriticalModal, IngestModal, IngestSelection, MainDashboard, SolutionModal
 from .tabs.ops import check_system_readiness
 from .widgets import PulsingEasyButton
+from .widgets import CommandInput
 
 
 _AUTO_COACH_COOLDOWN_SECS = 10
@@ -148,12 +149,11 @@ class CerealKillerApp(App[None]):
         except Exception:
             return
 
-    @on(Input.Submitted, "#command_input")
-    def on_input_submitted(self, event: Input.Submitted) -> None:
+    @on(CommandInput.Submitted, "#command_input")
+    def on_input_submitted(self, event: CommandInput.Submitted) -> None:
         prompt = event.value.strip()
         if not prompt:
             return
-        event.input.value = ""
         dashboard = self._dashboard()
         dashboard.append_user(prompt)
         self._append_chat("user", prompt)
