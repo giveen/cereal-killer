@@ -248,6 +248,7 @@ class ThinkingSessionStore:
         return {
             "reasoning-parser": self.settings.reasoning_parser,
             "reasoning_parser": self.settings.reasoning_parser,
+            "cache_prompt": True,
             "chat_template_kwargs": {
                 "preserve_thinking": True,
             },

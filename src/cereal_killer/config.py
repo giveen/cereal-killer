@@ -47,6 +47,15 @@ class Settings:
     snark_level: int = int(os.getenv("SNARK_LEVEL", "8"))
     # Loot report storage location.
     loot_report_dir: str = os.getenv("LOOT_REPORT_DIR", "data/loot_reports")
+    # Backend LLM request/response trace logging for troubleshooting hangs.
+    backend_trace_enabled: bool = os.getenv("BACKEND_TRACE_ENABLED", "1").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    backend_trace_path: str = os.getenv("BACKEND_TRACE_PATH", "logs/llm_backend.log")
+    backend_trace_max_chars: int = int(os.getenv("BACKEND_TRACE_MAX_CHARS", "8000"))
 
 
 HISTORY_CONTEXT_LIMIT = 50

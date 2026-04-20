@@ -20,6 +20,7 @@ from textual.widgets import Button, DirectoryTree, Input, Markdown, OptionList
 
 import httpx
 
+from cereal_killer.context_manager import ContextManager
 from cereal_killer.engine import LLMEngine
 from cereal_killer.ingest_logic import build_document_prompt, is_document_path, is_image_path
 from cereal_killer.kb.cve_jit import extract_cve_ids, fetch_cve, get_rate_snapshot
@@ -89,6 +90,7 @@ class CerealKillerApp(App[None]):
         self.easy_usage_count = 0
         self.successful_command_count = 0
         self.chat_transcript: list[dict[str, str]] = []
+        self._context_manager = ContextManager()
         self.current_target: str = ""
         self._pruning_in_flight = False
         self._analysis_jobs = 0
@@ -129,6 +131,7 @@ class CerealKillerApp(App[None]):
             self.push_screen(InfrastructureCriticalModal(self._preflight_reason))
         if hasattr(self.engine, "set_web_search_callback"):
             self.engine.set_web_search_callback(self._on_web_search_state)
+        self._update_context_token_counter()
 
     async def on_unmount(self) -> None:
         if self.observer_task:
@@ -204,6 +207,29 @@ class CerealKillerApp(App[None]):
         dashboard = self._dashboard()
         dashboard.set_active_view("gibson")
         dashboard.focus_gibson_input()
+        asyncio.create_task(self._refresh_gibson_thinking_buffer())
+
+    async def _refresh_gibson_thinking_buffer(self) -> None:
+        if not hasattr(self.engine, "get_thinking_buffer"):
+            return
+
+        machine_name = self.current_target or Path.cwd().name
+        try:
+            thought_buffer = await self.engine.get_thinking_buffer(machine_name, max_chars=8000)
+        except Exception:
+            return
+        if not thought_buffer.strip():
+            return
+
+        dashboard = self._try_dashboard()
+        if dashboard is None or self._gibson_snippets:
+            return
+
+        dashboard.query_one("#gibson_viewer", Markdown).update(
+            "# SESSION THOUGHT BUFFER\n\n"
+            "(Stored locally in Redis and excluded from normal next-turn prompt context unless requested.)\n\n"
+            f"```text\n{thought_buffer.strip()}\n```"
+        )
 
     @on(Button.Pressed, "#system_readiness_tag")
     def on_system_readiness_tag_pressed(self) -> None:
@@ -342,6 +368,7 @@ class CerealKillerApp(App[None]):
                 self.history_context,
                 pathetic_meter=self.pathetic_meter,
             )
+            self._update_llm_cache_metrics(response.backend_meta)
             await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
             phase = detect_phase(self.history_context)
             dashboard.set_phase(phase)
@@ -367,6 +394,7 @@ class CerealKillerApp(App[None]):
                 history_commands=self.history_context,
                 pathetic_meter=self.pathetic_meter,
             )
+            self._update_llm_cache_metrics(response.backend_meta)
             await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
         except Exception as exc:
             dashboard.append_system(f"Loot report error: {exc}", style="red")
@@ -401,6 +429,7 @@ class CerealKillerApp(App[None]):
                 history_commands=self.history_context,
                 pathetic_meter=self.pathetic_meter,
             )
+            self._update_llm_cache_metrics(response.backend_meta)
             await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
             self._vision_analyzed_sources.add(str(image_file.expanduser().resolve()))
             if mark_context:
@@ -433,6 +462,7 @@ class CerealKillerApp(App[None]):
                 self.history_context,
                 pathetic_meter=self.pathetic_meter,
             )
+            self._update_llm_cache_metrics(response.backend_meta)
             await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
             dashboard.append_system(f"Document Uploaded: {path.name}", style="bold cyan")
             dashboard.set_upload_progress(100, "DOC INGEST")
@@ -457,6 +487,7 @@ class CerealKillerApp(App[None]):
                 self.history_context,
                 pathetic_meter=self.pathetic_meter,
             )
+            self._update_llm_cache_metrics(response.backend_meta)
             await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
         except Exception as exc:
             dashboard.append_system(f"Auto-coach error: {exc}", style="red")
@@ -502,6 +533,7 @@ class CerealKillerApp(App[None]):
 
             if chunks:
                 response = await self.engine.synthesize_search_results(query, chunks)
+                self._update_llm_cache_metrics(response.backend_meta)
                 labeled_answer = f"## [SEARCH RESULT]\n\n{response.answer.strip()}"
                 await self._consume_llm_response(labeled_answer, response.reasoning_content or response.thought)
                 dashboard.show_gibson_summary(f"# GIBSON SUMMARY\n\n{response.answer.strip()}")
@@ -602,6 +634,7 @@ class CerealKillerApp(App[None]):
                     for s in self._gibson_snippets
                 ]
                 response = await self.engine.synthesize_search_results(query, rag_snippets)
+                self._update_llm_cache_metrics(response.backend_meta)
                 summary = f"# GIBSON SUMMARY\n\n{response.answer.strip()}"
                 dashboard.show_gibson_summary(summary)
         except Exception as exc:
@@ -637,6 +670,7 @@ class CerealKillerApp(App[None]):
                 for s in self._gibson_snippets
             ]
             response = await self.engine.synthesize_search_results(query, snippets)
+            self._update_llm_cache_metrics(response.backend_meta)
             cheat_sheet = f"# MASTER CHEAT SHEET\n\n{response.answer.strip()}"
             dashboard.query_one("#gibson_viewer", Markdown).update(cheat_sheet)
         except Exception as exc:
@@ -696,6 +730,17 @@ class CerealKillerApp(App[None]):
             if isinstance(screen, MainDashboard):
                 return screen
         return None
+
+    def _update_llm_cache_metrics(self, backend_meta: dict[str, object] | None) -> None:
+        dashboard = self._try_dashboard()
+        if dashboard is None or not backend_meta:
+            return
+
+        latency_obj = backend_meta.get("latency_ms")
+        cached_obj = backend_meta.get("tokens_cached")
+        latency_ms = latency_obj if isinstance(latency_obj, int) else None
+        tokens_cached = cached_obj if isinstance(cached_obj, int) else None
+        dashboard.set_llm_cache_metrics(latency_ms, tokens_cached)
 
     async def _consume_llm_response(self, answer: str, thought: str) -> None:
         # Persist assistant text first so we don't lose it if UI updates fail.
@@ -772,6 +817,7 @@ class CerealKillerApp(App[None]):
                     self._run_cve_jit_worker(event.feedback_line)
 
                 self.history_context = event.context_commands
+                self._update_context_token_counter()
                 phase = detect_phase(self.history_context)
                 dashboard.set_phase(phase)
                 self.engine.record_phase_change(phase)
@@ -1023,12 +1069,26 @@ class CerealKillerApp(App[None]):
     async def _maybe_prune_transcript(self) -> None:
         if self._pruning_in_flight:
             return
+
         total_chars = sum(len(e.get("text", "")) for e in self.chat_transcript)
         threshold = self.engine.prune_threshold()
-        if total_chars <= threshold:
+        needs_budget_prune = total_chars > threshold
+        needs_turn_condense = self._context_manager.should_condense(self.chat_transcript)
+
+        if not needs_budget_prune and not needs_turn_condense:
             return
+
         self._pruning_in_flight = True
         try:
+            if needs_turn_condense:
+                entries_to_summarize, remaining = self._context_manager.select_entries_for_condense(self.chat_transcript)
+                if entries_to_summarize:
+                    summary_blob = self._context_manager.build_summary_blob(entries_to_summarize)
+                    summary = await self.engine.summarize_session(summary_blob)
+                    self.chat_transcript = [self._context_manager.make_summary_entry(summary), *remaining]
+                    self._update_context_token_counter()
+                    return
+
             target = self.engine.prune_target()
             chars_to_drop = total_chars - target
             entries_to_summarize: list[dict[str, str]] = []
@@ -1051,6 +1111,7 @@ class CerealKillerApp(App[None]):
             }
             remaining = self.chat_transcript[len(entries_to_summarize):]
             self.chat_transcript = [summary_entry, *remaining]
+            self._update_context_token_counter()
         finally:
             self._pruning_in_flight = False
 
@@ -1062,6 +1123,19 @@ class CerealKillerApp(App[None]):
                 "timestamp": datetime.now(UTC).isoformat(),
             }
         )
+        self._update_context_token_counter()
+        self._schedule_context_prune()
+
+    def _update_context_token_counter(self) -> None:
+        dashboard = self._try_dashboard()
+        if dashboard is None:
+            return
+        current_tokens = self._context_manager.estimate_active_context_tokens(
+            self.chat_transcript,
+            self.history_context,
+        )
+        max_tokens = int(getattr(self.engine.settings, "max_model_len", 0) or 0)
+        dashboard.set_context_token_counter(current_tokens, max_tokens)
 
     def _warn_if_repetitive_response(self, new_response: str) -> None:
         last_assistant = ""

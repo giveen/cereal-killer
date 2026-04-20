@@ -321,6 +321,10 @@ class SidebarStatus(Vertical):
             yield Static("|", classes="ops-sep")
             yield Static("TOOL: Idle", id="active_tool", classes="ops-stat")
             yield Static("|", classes="ops-sep")
+            yield Static("LAT: --ms", id="llm_latency_status", classes="ops-stat")
+            yield Static("|", classes="ops-sep")
+            yield Static("CACHE: [yellow]COLD[/yellow]", id="llm_cache_status", classes="ops-stat")
+            yield Static("|", classes="ops-sep")
             yield Button("SETUP: CHECKING", id="system_readiness_tag", variant="default")
         with Horizontal(id="ops_bottom_row"):
             yield Static("", id="ops_spacer")
@@ -408,6 +412,21 @@ class SidebarStatus(Vertical):
             f"Setup missing{extra}\n"
             "Guide: docs/setup/README.md"
         )
+
+    def set_llm_cache_metrics(self, latency_ms: int | None, tokens_cached: int | None) -> None:
+        latency_widget = self.query_one("#llm_latency_status", Static)
+        cache_widget = self.query_one("#llm_cache_status", Static)
+
+        if isinstance(latency_ms, int) and latency_ms >= 0:
+            latency_widget.update(f"LAT: {latency_ms}ms")
+        else:
+            latency_widget.update("LAT: --ms")
+
+        cached = int(tokens_cached) if isinstance(tokens_cached, int) and tokens_cached > 0 else 0
+        if cached > 0:
+            cache_widget.update(f"CACHE: [green]CACHED[/green] ({cached})")
+        else:
+            cache_widget.update("CACHE: [yellow]COLD[/yellow]")
 
     def set_visual_buffer_image(self, image_path: Path, *, source: str, preview: str = "") -> None:
         self.query_one("#visual_buffer_collapsible", Collapsible).styles.display = "block"

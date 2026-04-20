@@ -153,6 +153,9 @@ Use environment variables (from `.env` in Docker or your shell locally):
 - `SEARXNG_VECTOR_THRESHOLD` (default `0.7`)
 - `SNARK_LEVEL` (default `8`)
 - `LOOT_REPORT_DIR` (default `data/loot_reports`)
+- `BACKEND_TRACE_ENABLED` (default `1`)
+- `BACKEND_TRACE_PATH` (default `logs/llm_backend.log`)
+- `BACKEND_TRACE_MAX_CHARS` (default `8000`)
 
 Docker compose also sets:
 
@@ -440,6 +443,18 @@ PYTHONPATH=src python3 -m unittest discover -s tests -q
 
 ### Common Fixes
 
+- Backend appears stuck between prompts (trace request/response payloads):
+
+```bash
+tail -n 200 logs/llm_backend.log
+```
+
+- Temporarily disable backend payload tracing:
+
+```bash
+BACKEND_TRACE_ENABLED=0 make
+```
+
 - Regenerate setup configuration when environment values drift:
 
 ```bash
@@ -451,6 +466,14 @@ python scripts/setup/generate_config.py
 ```bash
 ./scripts/setup/gibson_check.sh /home/${USER}/models/gibson
 tail -n 50 logs/setup.log
+```
+
+- Use a custom model directory without editing scripts:
+
+```bash
+MODEL_DIR=/path/to/your/models make check
+# or
+GIBSON_MODEL_DIR=/path/to/your/models make
 ```
 
 ## Contributing

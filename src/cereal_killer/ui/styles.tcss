@@ -132,12 +132,21 @@ Screen {
     height: auto;
     margin-bottom: 1;
     border: none;
+    layout: horizontal;
 }
 
 #context_chip {
     height: auto;
     padding: 0 1;
     border: none;
+}
+
+#context_token_counter {
+    width: 1fr;
+    height: auto;
+    padding: 0 1;
+    border: none;
+    content-align: right middle;
 }
 
 .muted-chip {

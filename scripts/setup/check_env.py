@@ -64,6 +64,70 @@ def check_cuda() -> CheckItem:
     return _fail("CUDA", f"nvcc failed: {out}")
 
 
+def _max_compute_capability() -> float | None:
+    if shutil.which("nvidia-smi") is None:
+        return None
+    ok, out = _run(
+        [
+            "nvidia-smi",
+            "--query-gpu=compute_cap",
+            "--format=csv,noheader",
+        ]
+    )
+    if not ok:
+        return None
+
+    caps: list[float] = []
+    for raw in out.splitlines():
+        value = raw.strip().split()[0] if raw.strip() else ""
+        if not value:
+            continue
+        try:
+            caps.append(float(value))
+        except ValueError:
+            continue
+    if not caps:
+        return None
+    return max(caps)
+
+
+def check_llama_server_flags() -> CheckItem:
+    llama_server = shutil.which("llama-server")
+    if llama_server is None:
+        return _warn("llama-server", "llama-server not found in PATH; skipped cache-flag validation")
+
+    ok, out = _run([llama_server, "--help"])
+    if not ok:
+        return _warn("llama-server", f"failed to read --help output: {out}")
+
+    help_text = out or ""
+    has_slots = "--slots" in help_text
+    has_cache_reuse = "--cache-reuse" in help_text
+    has_legacy_prompt_cache = "--prompt-cache" in help_text or "--prompt-cache-all" in help_text
+    cc = _max_compute_capability()
+    is_cc_12 = bool(cc is not None and cc >= 12.0)
+
+    if not has_slots or not has_cache_reuse:
+        return _fail(
+            "llama-server",
+            "missing --slots/--cache-reuse support; install a modern llama.cpp build",
+        )
+
+    if has_legacy_prompt_cache and is_cc_12:
+        return _warn(
+            "llama-server",
+            "legacy --prompt-cache flags detected, but CC 12.0 GPU found; defaulting to slot-based reuse (--slots 1 + --cache-reuse)",
+        )
+
+    if has_legacy_prompt_cache:
+        return _warn(
+            "llama-server",
+            "legacy --prompt-cache flags detected; supported, but slot-based reuse is the default path",
+        )
+
+    return _pass("llama-server", "modern slot-based cache flags detected (no legacy prompt-cache flags)")
+
+
 def _llama_vram_warning() -> CheckItem | None:
     if shutil.which("nvidia-smi") is None:
         return None
@@ -173,6 +237,7 @@ def main() -> int:
     checks: list[CheckItem] = [
         check_nvidia(),
         check_cuda(),
+        check_llama_server_flags(),
         *check_llama_swap(),
         check_redis(args.redis_host, args.redis_port, args.redis_timeout),
         check_model_dir(args.model_dir),

@@ -22,6 +22,7 @@ class LLMResponse:
     thought: str
     answer: str
     reasoning_content: str = ""
+    backend_meta: dict[str, object] | None = None
 
 
 class LLMEngine:
@@ -47,6 +48,7 @@ class LLMEngine:
             thought=response.thought,
             answer=response.answer,
             reasoning_content=response.reasoning_content,
+            backend_meta=response.backend_meta,
         )
 
     async def react_to_command(
@@ -64,6 +66,7 @@ class LLMEngine:
             thought=response.thought,
             answer=response.answer,
             reasoning_content=response.reasoning_content,
+            backend_meta=response.backend_meta,
         )
 
     async def diagnose_failure(
@@ -81,6 +84,7 @@ class LLMEngine:
             thought=response.thought,
             answer=response.answer,
             reasoning_content=response.reasoning_content,
+            backend_meta=response.backend_meta,
         )
 
     async def chat_with_image(
@@ -100,6 +104,7 @@ class LLMEngine:
             thought=response.thought,
             answer=response.answer,
             reasoning_content=response.reasoning_content,
+            backend_meta=response.backend_meta,
         )
 
     async def persist_mental_state(self, history_commands: list[str] | None = None) -> None:
@@ -121,6 +126,7 @@ class LLMEngine:
             thought=response.thought,
             answer=response.answer,
             reasoning_content=response.reasoning_content,
+            backend_meta=response.backend_meta,
         )
 
     async def clear_session(self, machine_name: str) -> None:
@@ -128,7 +134,7 @@ class LLMEngine:
 
     def set_system_prompt_addendum(self, addendum: str) -> None:
         """Inject a per-session system prompt block (set by /box or /new-box)."""
-        self._brain.system_prompt_addendum = addendum
+        self._brain.set_system_prompt_addendum(addendum)
 
     def set_web_search_callback(self, callback: "Callable[[bool], None]") -> None:
         """Register a callback invoked with True when web search starts, False when done."""
@@ -176,7 +182,11 @@ class LLMEngine:
             thought=response.thought,
             answer=response.answer,
             reasoning_content=response.reasoning_content,
+            backend_meta=response.backend_meta,
         )
+
+    async def get_thinking_buffer(self, machine_name: str, max_chars: int = 6000) -> str:
+        return await self._brain.get_thinking_buffer(machine_name=machine_name, max_chars=max_chars)
 
     def prune_threshold(self) -> int:
         """Character count at which the transcript should be pruned."""

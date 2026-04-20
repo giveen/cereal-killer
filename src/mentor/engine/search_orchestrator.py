@@ -33,6 +33,17 @@ from mentor.tools.web_search import WebResult, format_web_results, search as web
 # We invert: score = 1 - distance; so a score < threshold → go to web.
 _DEFAULT_VECTOR_THRESHOLD = RAG_NOT_EMPTY_SIMILARITY_THRESHOLD
 _DEFAULT_INDEX_PRIORITY = ["ippsec", "gtfobins", "lolbas", "hacktricks", "payloads"]
+_REFERENCE_TOKEN_BUDGET = 1500
+_GENERIC_METHOD_HINTS = (
+    "nmap",
+    "gobuster",
+    "dirsearch",
+    "enumeration",
+    "methodology",
+    "cheatsheet",
+    "general",
+    "recon",
+)
 
 
 def _resolve_index_priority(settings: Settings) -> list[str]:
@@ -79,6 +90,66 @@ def _best_vector_score(snippets: list[RAGSnippet]) -> float:
     return 1.0 - best_distance
 
 
+def _snippet_token_cost(snippet: RAGSnippet) -> int:
+    text = "\n".join(
+        [
+            snippet.title or "",
+            snippet.url or "",
+            snippet.content or "",
+        ]
+    )
+    # Fast approximation is sufficient for dynamic context budgeting.
+    return max(1, len(text) // 4)
+
+
+def _snippet_priority(snippet: RAGSnippet, target_machine: str | None) -> tuple[int, float, int]:
+    target = (target_machine or "").strip().lower()
+    machine = (snippet.machine or "").strip().lower()
+    searchable = " ".join(
+        [
+            machine,
+            (snippet.title or "").lower(),
+            (snippet.content or "").lower(),
+        ]
+    )
+    is_target_specific = bool(target) and (machine == target or target in searchable)
+    looks_generic = any(hint in searchable for hint in _GENERIC_METHOD_HINTS)
+    priority = 2 if is_target_specific else 0
+    if looks_generic:
+        priority -= 1
+    similarity = 1.0 - float(snippet.score or 0.0)
+    return priority, similarity, -_snippet_token_cost(snippet)
+
+
+def _trim_snippets_to_budget(
+    snippets: list[RAGSnippet],
+    *,
+    target_machine: str | None,
+    token_budget: int,
+) -> list[RAGSnippet]:
+    if not snippets or token_budget <= 0:
+        return snippets
+
+    ranked = sorted(
+        snippets,
+        key=lambda snippet: _snippet_priority(snippet, target_machine),
+        reverse=True,
+    )
+
+    kept: list[RAGSnippet] = []
+    used_tokens = 0
+    for snippet in ranked:
+        cost = _snippet_token_cost(snippet)
+        if used_tokens + cost > token_budget and kept:
+            continue
+        kept.append(snippet)
+        used_tokens += cost
+        if used_tokens >= token_budget:
+            break
+
+    return kept or ranked[:1]
+
+
 async def tiered_search(
     query: str,
     settings: Settings,
@@ -91,6 +162,7 @@ async def tiered_search(
     max_web_results: int = 5,
     top_k: int = 3,
     source_filters: list[str] | None = None,
+    reference_token_budget: int = _REFERENCE_TOKEN_BUDGET,
 ) -> SearchResult:
     """Run the tiered search pipeline.
 
@@ -118,6 +190,11 @@ async def tiered_search(
         target_machine=target_machine,
         index_order=_resolve_index_priority(settings),
         source_filters=source_filters,
+    )
+    vector_snippets = _trim_snippets_to_budget(
+        vector_snippets,
+        target_machine=target_machine,
+        token_budget=reference_token_budget,
     )
     best_score = _best_vector_score(vector_snippets)
 

@@ -180,6 +180,21 @@ def _prompt_llama_server(repo_root: Path, accept_defaults: bool) -> Path:
         print(f"llama-server binary not found: {path}")
 
 
+def _llama_server_supports_flag(llama_server_path: Path, flag: str) -> bool:
+    try:
+        result = subprocess.run(
+            [str(llama_server_path), "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return False
+
+    help_text = (result.stdout or "") + "\n" + (result.stderr or "")
+    return flag in help_text
+
+
 def _detect_total_vram_gb() -> float | None:
     try:
         result = subprocess.run(
@@ -358,6 +373,8 @@ def write_llama_swap_config(
                 f"      --model {model.model_path} \\",
                 f"      --mmproj {model.mmproj_path} \\",
                 "      --port ${PORT} \\",
+                "      --slots 1 \\",
+                "      --cache-reuse \\",
                 f"      --gpu-layers {gpu_layers} \\",
                 f"      --ctx-size {ctx_size} \\",
                 "      --batch-size 2048 \\",
@@ -438,6 +455,12 @@ def main() -> int:
 
     llama_config_target = repo_root / "config" / "llama-swap" / "config.yaml"
     llama_server_path = _prompt_llama_server(repo_root, accept_defaults)
+    cache_reuse_supported = _llama_server_supports_flag(llama_server_path, "--cache-reuse")
+    slots_supported = _llama_server_supports_flag(llama_server_path, "--slots")
+    if not slots_supported or not cache_reuse_supported:
+        print("ERROR: llama-server must support both --slots and --cache-reuse.")
+        print("This setup enforces modern slot-based KV reuse and does not use legacy prompt-cache flags.")
+        return 2
     gpu_layers = choose_int("GPU offload layers (gpu-layers)", gpu_layers_default, accept_defaults)
     if gpu_layers == 99 and nvidia_check.status != "PASS":
         print("ERROR: --gpu-layers 99 requires a passing NVIDIA check.")

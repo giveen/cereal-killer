@@ -210,6 +210,7 @@ class MainDashboard(Screen[None]):
                     yield Static("", id="boot_status_box")
                     with Horizontal(id="context_chip_row"):
                         yield Static("NO ACTIVE FILE CONTEXT", id="context_chip", classes="context-chip muted-chip")
+                        yield Static("Active Context: 0 / 0", id="context_token_counter", classes="context-chip muted-chip")
                     yield VerticalScroll(id="chat_log")
                     yield Static("LATEST RESPONSE", id="response_title")
                     yield Markdown("_No response yet._", id="response_markdown", open_links=False)
@@ -336,6 +337,14 @@ class MainDashboard(Screen[None]):
     def set_system_readiness(self, ok: bool, details: str = "") -> None:
         sidebar = self.query_one("#intel_sidebar", SidebarStatus)
         sidebar.set_system_readiness(ok, details)
+
+    def set_llm_cache_metrics(self, latency_ms: int | None, tokens_cached: int | None) -> None:
+        sidebar = self.query_one("#intel_sidebar", SidebarStatus)
+        sidebar.set_llm_cache_metrics(latency_ms, tokens_cached)
+
+    def set_context_token_counter(self, current_tokens: int, max_tokens: int) -> None:
+        counter = self.query_one("#context_token_counter", Static)
+        counter.update(f"Active Context: {max(0, current_tokens)} / {max(0, max_tokens)}")
 
     async def pulse_terminal_link(self) -> None:
         """Pulse the terminal link indicator to show data is flowing."""

@@ -6,9 +6,33 @@ AMBER="\033[33m"
 RED="\033[91m"
 RESET="\033[0m"
 
-MODEL_DIR="${1:-~/models/gibson}"
-if [[ "$MODEL_DIR" == ~* ]]; then
-	MODEL_DIR="${MODEL_DIR/#\~/$HOME}"
+expand_path() {
+	local path="$1"
+	if [[ "$path" == ~* ]]; then
+		path="${path/#\~/$HOME}"
+	fi
+	printf "%s" "$path"
+}
+
+MODEL_DIR="${1:-${GIBSON_MODEL_DIR:-${MODEL_DIR:-~/models/gibson}}}"
+MODEL_DIR="$(expand_path "$MODEL_DIR")"
+
+if [[ ! -d "$MODEL_DIR" ]]; then
+	echo -e "${AMBER}[gibson_check] Model directory not found: ${MODEL_DIR}${RESET}"
+	echo -e "${AMBER}[gibson_check] Tip: pass a path or set GIBSON_MODEL_DIR/MODEL_DIR.${RESET}"
+
+	if [[ -t 0 ]]; then
+		while true; do
+			read -r -p "Enter model directory path: " user_model_dir
+			user_model_dir="$(expand_path "${user_model_dir}")"
+			if [[ -d "$user_model_dir" ]]; then
+				MODEL_DIR="$user_model_dir"
+				break
+			fi
+			echo -e "${RED}[gibson_check] Directory not found: ${user_model_dir}${RESET}"
+			echo -e "${AMBER}[gibson_check] Try again or Ctrl+C to abort.${RESET}"
+		done
+	fi
 fi
 
 mkdir -p logs
