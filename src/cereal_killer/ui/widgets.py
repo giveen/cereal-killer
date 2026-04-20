@@ -46,8 +46,25 @@ class PulsingEasyButton(Button):
 
 
 class CommandInput(Input):
+    BINDINGS = [("ctrl+v", "paste_clipboard", "Paste")]
+
     def __init__(self) -> None:
         super().__init__(placeholder="Type /box or ask Zero Cool...", id="command_input")
+
+    def action_paste_clipboard(self) -> None:
+        """Read system clipboard and insert text at current cursor position."""
+        from mentor.utils.clipboard import read_text
+        text = read_text()
+        if not text:
+            return
+        # Strip newlines so a multi-line clipboard entry becomes one line.
+        cleaned = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip()
+        if not cleaned:
+            return
+        # Insert at cursor: splice into current value.
+        pos = self.cursor_position
+        self.value = self.value[:pos] + cleaned + self.value[pos:]
+        self.cursor_position = pos + len(cleaned)
 
 
 class ChatMessage(Static):
@@ -224,6 +241,9 @@ class SidebarStatus(Vertical):
         yield Static("VISUAL BUFFER", id="visual_buffer_label")
         yield Static("clipboard_obs.png\n(waiting for screenshot)", id="visual_buffer")
         yield Button("Clear Buffer", id="clear_visual_buffer", variant="warning")
+        yield Static("UPLOAD PIPELINE", id="upload_progress_label")
+        yield VerticalProgressBar(max_value=100, value=0, height=4, id="upload_progress_bar")
+        yield Static("0%", id="upload_progress_value")
         yield Static("PATHETIC METER", id="pathetic_meter")
         yield VerticalProgressBar(max_value=10, value=0, height=10, id="pathetic_meter_bar")
         yield Static("0/10", id="pathetic_meter_value")
@@ -256,3 +276,9 @@ class SidebarStatus(Vertical):
             value = statuses.get(name, "never")
             lines.append(f"{name}: {value}")
         self.query_one("#knowledge_sync_status", Static).update("\n".join(lines))
+
+    def set_upload_progress(self, value: int, label: str = "UPLOAD") -> None:
+        progress = max(0, min(100, value))
+        self.query_one("#upload_progress_label", Static).update(f"{label}\n{progress}%")
+        self.query_one("#upload_progress_bar", VerticalProgressBar).set_value(progress)
+        self.query_one("#upload_progress_value", Static).update(f"{progress}%")

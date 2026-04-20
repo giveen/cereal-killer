@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import re
 import webbrowser
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 from urllib.parse import quote, unquote
 
 from textual import on
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, Collapsible, DirectoryTree, LoadingIndicator, Markdown, Static
+from textual.widgets import Button, DirectoryTree, Input, LoadingIndicator, Markdown, OptionList, Static
 
 from mentor.utils.clipboard import copy_text
 
@@ -84,6 +86,79 @@ class SolutionModal(ModalScreen[None]):
         self.dismiss(None)
 
 
+@dataclass(slots=True)
+class IngestSelection:
+    path: Path
+    ingest_type: str
+
+
+class FilteredIngestTree(DirectoryTree):
+    def __init__(self, path: str, *, allowed_suffixes: set[str], **kwargs: object) -> None:
+        super().__init__(path, **kwargs)
+        self.allowed_suffixes = {suffix.lower() for suffix in allowed_suffixes}
+
+    def filter_paths(self, paths: Iterable[Path]) -> Iterable[Path]:
+        filtered: list[Path] = []
+        for candidate in paths:
+            try:
+                if candidate.is_dir() or candidate.suffix.lower() in self.allowed_suffixes:
+                    filtered.append(candidate)
+            except OSError:
+                continue
+        return filtered
+
+
+class IngestModal(ModalScreen[IngestSelection | None]):
+    IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
+    DOCUMENT_SUFFIXES = {".log", ".txt", ".json"}
+
+    def __init__(self, ingest_type: str, root_path: Path) -> None:
+        super().__init__()
+        self.ingest_type = ingest_type
+        self.root_path = root_path
+        self._selected_path: Path | None = None
+
+    @property
+    def allowed_suffixes(self) -> set[str]:
+        return self.IMAGE_SUFFIXES if self.ingest_type == "image" else self.DOCUMENT_SUFFIXES
+
+    def compose(self) -> ComposeResult:
+        mode_label = "SCREENSHOT INGEST" if self.ingest_type == "image" else "DOCUMENT INGEST"
+        with Vertical(id="ingest_modal_shell"):
+            yield Static(f"{mode_label} // Select source file", id="ingest_modal_title")
+            yield FilteredIngestTree(
+                str(self.root_path),
+                id="ingest_modal_tree",
+                allowed_suffixes=self.allowed_suffixes,
+            )
+            suffix_hint = ", ".join(sorted(self.allowed_suffixes))
+            yield Static(f"Allowed: {suffix_hint}", id="ingest_modal_hint")
+            yield Static("Selected: none", id="ingest_modal_selected")
+            with Horizontal(id="ingest_modal_actions"):
+                yield Button("[SUBMIT TO GIBSON]", id="ingest_modal_submit", variant="primary")
+                yield Button("Cancel", id="ingest_modal_cancel", variant="default")
+
+    @on(DirectoryTree.FileSelected, "#ingest_modal_tree")
+    def on_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
+        chosen = Path(event.path)
+        if chosen.suffix.lower() not in self.allowed_suffixes:
+            self.notify("File type not allowed in this ingest mode", title="Ingest", severity="warning")
+            return
+        self._selected_path = chosen
+        self.query_one("#ingest_modal_selected", Static).update(f"Selected: {chosen.name}")
+
+    @on(Button.Pressed, "#ingest_modal_submit")
+    def submit_ingest(self) -> None:
+        if self._selected_path is None:
+            self.notify("Select a file first", title="Ingest", severity="warning")
+            return
+        self.dismiss(IngestSelection(path=self._selected_path, ingest_type=self.ingest_type))
+
+    @on(Button.Pressed, "#ingest_modal_cancel")
+    def cancel_ingest(self) -> None:
+        self.dismiss(None)
+
+
 class MainDashboard(Screen[None]):
     def __init__(self) -> None:
         super().__init__()
@@ -93,16 +168,22 @@ class MainDashboard(Screen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dashboard"):
+            yield Static("GIBSON MAIN FRAME - AUTHORIZED ACCESS ONLY", id="main_header")
             with Horizontal(id="view_tabs"):
                 yield Button("Chat", id="tab_chat", variant="primary")
                 yield Button("Ops", id="tab_ops", variant="default")
+                yield Button("Gibson", id="tab_gibson", variant="default")
             with Horizontal(id="main_row"):
                 with Vertical(id="explorer_pane"):
-                    with Collapsible(title="📸 Screenshots", collapsed=False, id="upload_collapsible"):
-                        screenshots_dir = Path("/screenshots") if Path("/screenshots").exists() else Path.cwd()
-                        yield DirectoryTree(str(screenshots_dir), id="upload_tree")
+                    with Horizontal(id="ingest_icon_row"):
+                        yield Button("📸", id="open_image_ingest", variant="default")
+                        yield Button("📄", id="open_document_ingest", variant="default")
+                    screenshots_dir = Path("/screenshots") if Path("/screenshots").exists() else Path.cwd()
+                    yield DirectoryTree(str(screenshots_dir), id="upload_tree")
                 with Vertical(id="left_pane"):
                     yield Static("", id="boot_status_box")
+                    with Horizontal(id="context_chip_row"):
+                        yield Static("NO ACTIVE FILE CONTEXT", id="context_chip", classes="context-chip muted-chip")
                     yield VerticalScroll(id="chat_log")
                     yield Static("LATEST RESPONSE", id="response_title")
                     yield Markdown("_No response yet._", id="response_markdown", open_links=False)
@@ -111,8 +192,31 @@ class MainDashboard(Screen[None]):
                         yield Button("Copy Code", id="copy_code", variant="primary")
                         yield LoadingIndicator(id="analysis_loading")
                 yield SidebarStatus()
+                with Vertical(id="gibson_pane"):
+                    yield Static("▶ GIBSON // LOCAL KNOWLEDGE BASE", id="gibson_header")
+                    yield Input(
+                        placeholder="Search local RAG (HackTricks, IppSec, Payloads)…",
+                        id="gibson_search_input",
+                    )
+                    with Horizontal(id="gibson_split"):
+                        with VerticalScroll(id="gibson_list_pane"):
+                            yield OptionList(id="gibson_result_list")
+                        with VerticalScroll(id="gibson_viewer_pane"):
+                            yield Markdown(
+                                "_Run a search to load content._",
+                                id="gibson_viewer",
+                                open_links=False,
+                            )
+                    with Horizontal(id="gibson_actions"):
+                        yield Button(
+                            "⚡ Synthesize Master Cheat Sheet",
+                            id="gibson_synthesize",
+                            variant="warning",
+                        )
+                        yield LoadingIndicator(id="gibson_loading")
             with Horizontal(id="bottom_row"):
                 yield CommandInput()
+            yield Static("RAM --.-/--.-GB | 5090 --C", id="system_footer")
 
     def chat_log(self) -> VerticalScroll:
         return self.query_one("#chat_log", VerticalScroll)
@@ -239,13 +343,27 @@ class MainDashboard(Screen[None]):
         self.set_active_view(self._active_view)
 
     def toggle_upload_tree(self) -> None:
-        """Toggle the explorer pane visibility (U shortcut)."""
+        """Toggle the file tree open/closed; the pane button strip stays visible."""
+        tree = self.query_one("#upload_tree", DirectoryTree)
         explorer = self.query_one("#explorer_pane", Vertical)
-        # Use CSS display instead of class to avoid media query conflicts
-        if explorer.styles.display == "none":
-            explorer.styles.display = "block"
+        if tree.styles.display == "none":
+            tree.styles.display = "block"
+            explorer.styles.width = "30"
         else:
-            explorer.styles.display = "none"
+            tree.styles.display = "none"
+            explorer.styles.width = "auto"
+
+    @on(Button.Pressed, "#open_image_ingest")
+    def on_open_image_ingest(self) -> None:
+        action = getattr(self.app, "action_open_image_ingest", None)
+        if callable(action):
+            action()
+
+    @on(Button.Pressed, "#open_document_ingest")
+    def on_open_document_ingest(self) -> None:
+        action = getattr(self.app, "action_open_document_ingest", None)
+        if callable(action):
+            action()
 
     @on(Button.Pressed, "#tab_chat")
     def show_chat_view(self) -> None:
@@ -261,10 +379,23 @@ class MainDashboard(Screen[None]):
         tree.path = target
         tree.root.label = str(target)
         tree.reload()
+        # Keep tree hidden until user explicitly toggles it.
+        tree.styles.display = "none"
 
     def set_loading(self, active: bool) -> None:
         indicator = self.query_one("#analysis_loading", LoadingIndicator)
         indicator.display = active
+
+    def set_upload_progress(self, value: int, label: str = "UPLOAD") -> None:
+        sidebar = self.query_one("#intel_sidebar", SidebarStatus)
+        sidebar.set_upload_progress(value, label)
+
+    def set_context_chip(self, filename: str, *, ingest_type: str) -> None:
+        chip = self.query_one("#context_chip", Static)
+        marker = "IMG" if ingest_type == "image" else "DOC"
+        chip.update(f"[{marker}] {filename}")
+        chip.remove_class("muted-chip")
+        chip.add_class("active-chip")
 
     def set_boot_status(self, text: str) -> None:
         box = self.query_one("#boot_status_box", Static)
@@ -280,22 +411,108 @@ class MainDashboard(Screen[None]):
         explorer = self.query_one("#explorer_pane", Vertical)
         left_pane = self.query_one("#left_pane", Vertical)
         sidebar = self.query_one("#intel_sidebar", SidebarStatus)
+        gibson_pane = self.query_one("#gibson_pane", Vertical)
         tab_chat = self.query_one("#tab_chat", Button)
         tab_ops = self.query_one("#tab_ops", Button)
+        tab_gibson = self.query_one("#tab_gibson", Button)
+        main_row = self.query_one("#main_row", Horizontal)
 
-        self._active_view = "ops" if view == "ops" else "chat"
-        if self._active_view == "ops":
+        if view == "ops":
+            self._active_view = "ops"
             explorer.styles.display = "none"
             left_pane.styles.display = "none"
             sidebar.styles.display = "block"
-            tab_chat.variant = "default"
-            tab_ops.variant = "primary"
+            gibson_pane.styles.display = "none"
+            self._set_tab_states(tab_chat, tab_ops, tab_gibson, active="ops")
+        elif view == "gibson":
+            self._active_view = "gibson"
+            explorer.styles.display = "none"
+            left_pane.styles.display = "none"
+            sidebar.styles.display = "none"
+            gibson_pane.styles.display = "block"
+            self._set_tab_states(tab_chat, tab_ops, tab_gibson, active="gibson")
         else:
+            self._active_view = "chat"
             explorer.styles.display = "block"
             left_pane.styles.display = "block"
             sidebar.styles.display = "none"
-            tab_chat.variant = "primary"
-            tab_ops.variant = "default"
+            gibson_pane.styles.display = "none"
+            self._set_tab_states(tab_chat, tab_ops, tab_gibson, active="chat")
+
+        # Brief tint pulse to mimic CRT refresh when changing views.
+        self.add_class("crt-refresh")
+        self.set_timer(0.12, lambda: self.remove_class("crt-refresh"))
+        main_row.styles.opacity = 0.92
+        main_row.animate("opacity", 1.0, duration=0.16)
+
+    @on(Button.Pressed, "#tab_gibson")
+    def show_gibson_view(self) -> None:
+        self.set_active_view("gibson")
+    # ── Gibson helpers ──────────────────────────────────────────────────────
+
+    def set_gibson_results(self, snippets: list[dict]) -> None:
+        """Populate the OptionList with snippet titles and show the first."""
+        option_list = self.query_one("#gibson_result_list", OptionList)
+        list_pane = self.query_one("#gibson_list_pane", VerticalScroll)
+        viewer_pane = self.query_one("#gibson_viewer_pane", VerticalScroll)
+        option_list.clear_options()
+        for snippet in snippets:
+            source_label = f"[{snippet.get('source', '?')}]"
+            title = (snippet.get("title") or "")[:55]
+            option_list.add_option(f"{source_label} {title}".strip())
+        if snippets:
+            self.show_gibson_snippet(snippets[0])
+        else:
+            self.query_one("#gibson_viewer", Markdown).update("_No results found._")
+
+        # Fade-in animation for new Gibson results.
+        list_pane.styles.opacity = 0.0
+        viewer_pane.styles.opacity = 0.0
+        list_pane.animate("opacity", 1.0, duration=0.24)
+        viewer_pane.animate("opacity", 1.0, duration=0.24)
+
+    def show_gibson_snippet(self, snippet: dict) -> None:
+        self.query_one("#gibson_viewer", Markdown).update(
+            self._build_gibson_markdown(snippet)
+        )
+
+    def set_gibson_loading(self, active: bool) -> None:
+        self.query_one("#gibson_loading", LoadingIndicator).display = active
+
+    def focus_gibson_input(self) -> None:
+        self.query_one("#gibson_search_input", Input).focus()
+
+    def set_system_footer(self, text: str) -> None:
+        self.query_one("#system_footer", Static).update(text)
+
+    @staticmethod
+    def _set_tab_states(tab_chat: Button, tab_ops: Button, tab_gibson: Button, *, active: str) -> None:
+        tab_map = {"chat": tab_chat, "ops": tab_ops, "gibson": tab_gibson}
+        for name, button in tab_map.items():
+            button.variant = "default"
+            button.remove_class("active-tab")
+            button.add_class("inactive-tab")
+            if name == active:
+                button.add_class("active-tab")
+                button.remove_class("inactive-tab")
+
+    @staticmethod
+    def _build_gibson_markdown(snippet: dict) -> str:
+        parts: list[str] = []
+        title = snippet.get("title", "")
+        source = snippet.get("source", "")
+        url = snippet.get("url", "")
+        content = snippet.get("content", "")
+        if title:
+            parts.append(f"# {title}")
+        if source:
+            parts.append(f"> **Source:** {source}")
+        if url:
+            parts.append(f"> **URL:** [{url}]({url})")
+        parts.append("")
+        parts.append(content)
+        return "\n".join(parts)
+
 
     def _update_response_markdown(self, text: str) -> None:
         self._last_response_raw = text or ""

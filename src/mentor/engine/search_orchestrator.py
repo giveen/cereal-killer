@@ -18,14 +18,20 @@ import asyncio
 from dataclasses import dataclass, field
 
 from cereal_killer.config import Settings
-from mentor.kb.query import RAGSnippet, format_reference_material, retrieve_reference_material
+from mentor.kb.query import (
+    RAG_NOT_EMPTY_SIMILARITY_THRESHOLD,
+    RAGSnippet,
+    format_reference_material,
+    retrieve_reference_material,
+    top_similarity_scores,
+)
 from mentor.tools.web_search import WebResult, format_web_results, search as web_search
 
 
 # Cosine distance ≥ this means the local index has no useful material.
 # redisvl returns vector_distance where 0 = identical, 1 = orthogonal.
 # We invert: score = 1 - distance; so a score < threshold → go to web.
-_DEFAULT_VECTOR_THRESHOLD = 0.7
+_DEFAULT_VECTOR_THRESHOLD = RAG_NOT_EMPTY_SIMILARITY_THRESHOLD
 _DEFAULT_INDEX_PRIORITY = ["ippsec", "gtfobins", "lolbas", "hacktricks", "payloads"]
 
 
@@ -42,6 +48,7 @@ class SearchResult:
     # Raw artefacts for inspection / testing.
     vector_snippets: list[RAGSnippet] = field(default_factory=list)
     web_results: list[WebResult] = field(default_factory=list)
+    top_similarity_scores: list[float] = field(default_factory=list)
 
 
 def _best_vector_score(snippets: list[RAGSnippet]) -> float:
@@ -139,4 +146,5 @@ async def tiered_search(
         used_web=bool(web_results),
         vector_snippets=vector_snippets,
         web_results=web_results,
+        top_similarity_scores=top_similarity_scores(vector_snippets, top_n=3),
     )

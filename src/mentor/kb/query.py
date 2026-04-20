@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -22,12 +23,14 @@ from mentor.ui.phase import detect_phase
 
 
 EMBEDDING_DIMS = 64
+RAG_NOT_EMPTY_SIMILARITY_THRESHOLD = 0.40
 _RERANK_CANDIDATES = 10
 _CONTEXT_CACHE_TURNS = 3
 _CONTEXT_CACHE_TTL_SECS = 60 * 60 * 6
 
 _CROSS_ENCODER: Any | None = None
 _CROSS_ENCODER_LOAD_ATTEMPTED = False
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -129,6 +132,25 @@ def _extract_phase(text: str) -> str:
     if any(token in lowered for token in ("nmap", "gobuster", "enumeration", "scan", "dirsearch")):
         return "recon"
     return "unknown"
+
+
+def similarity_from_distance(distance: float) -> float:
+    """Convert Redis cosine distance into similarity in [0, 1]."""
+    return max(0.0, min(1.0, 1.0 - float(distance or 0.0)))
+
+
+def top_similarity_scores(snippets: list[RAGSnippet], top_n: int = 3) -> list[float]:
+    """Return top-N similarities (descending), useful for UI debug output."""
+    sims = sorted((similarity_from_distance(item.score) for item in snippets), reverse=True)
+    return sims[: max(0, top_n)]
+
+
+def has_confident_match(
+    snippets: list[RAGSnippet],
+    threshold: float = RAG_NOT_EMPTY_SIMILARITY_THRESHOLD,
+) -> bool:
+    """A retrieval is non-empty when any chunk exceeds the similarity threshold."""
+    return any(similarity_from_distance(item.score) >= threshold for item in snippets)
 
 
 def _phase_bucket(context_commands: list[str]) -> str:
@@ -246,8 +268,25 @@ def _rerank_snippets(query: str, snippets: list[RAGSnippet], phase_bucket: str, 
         phase_bonus = 0.0
         if phase_bucket != "unknown" and item.phase == phase_bucket:
             phase_bonus = 0.20
-        vector_similarity = 1.0 - float(item.score or 0.0)
-        return (0.65 * item.rerank_score) + (0.25 * vector_similarity) + phase_bonus - item.cache_penalty
+        vector_similarity = similarity_from_distance(item.score)
+
+        # Intent-aware source boost for common priv-esc search phrases.
+        q = query.lower()
+        source = (item.source or "").lower()
+        source_bonus = 0.0
+        if ("find" in q and "suid" in q) or "setuid" in q or "sudo -l" in q:
+            if source == "gtfobins":
+                source_bonus += 0.25
+            if source == "hacktricks":
+                source_bonus += 0.22
+
+        return (
+            (0.65 * item.rerank_score)
+            + (0.25 * vector_similarity)
+            + phase_bonus
+            + source_bonus
+            - item.cache_penalty
+        )
 
     return sorted(filtered, key=_rank, reverse=True)
 
@@ -380,6 +419,11 @@ def retrieve_reference_material(
             if unique_hits:
                 reranked = _rerank_snippets(command_or_prompt, unique_hits, phase_bucket, recent_fingerprints)
                 selected = reranked[:top_k]
+                _LOG.info(
+                    "RAG top-3 similarity (%s): %s",
+                    command_or_prompt,
+                    ", ".join(f"{score:.3f}" for score in top_similarity_scores(selected, top_n=3)) or "none",
+                )
                 _store_recent_snippet_fingerprints(settings, machine_name, selected)
                 return selected
 
@@ -404,11 +448,21 @@ def retrieve_reference_material(
         if machine_matches:
             reranked = _rerank_snippets(command_or_prompt, machine_matches, phase_bucket, recent_fingerprints)
             selected = reranked[:top_k]
+            _LOG.info(
+                "RAG top-3 similarity (%s): %s",
+                command_or_prompt,
+                ", ".join(f"{score:.3f}" for score in top_similarity_scores(selected, top_n=3)) or "none",
+            )
             _store_recent_snippet_fingerprints(settings, machine_name, selected)
             return selected
 
     reranked = _rerank_snippets(command_or_prompt, combined, phase_bucket, recent_fingerprints)
     selected = reranked[:top_k]
+    _LOG.info(
+        "RAG top-3 similarity (%s): %s",
+        command_or_prompt,
+        ", ".join(f"{score:.3f}" for score in top_similarity_scores(selected, top_n=3)) or "none",
+    )
     _store_recent_snippet_fingerprints(settings, machine_name, selected)
     return selected
 

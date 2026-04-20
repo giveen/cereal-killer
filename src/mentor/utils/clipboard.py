@@ -31,3 +31,35 @@ def copy_text(text: str, fallback: Callable[[str], None] | None = None) -> None:
 
     if fallback is not None:
         fallback(content)
+
+
+def read_text() -> str:
+    """Read text from the system clipboard.  Returns empty string on failure."""
+    # Try pyperclip first.
+    if pyperclip is not None:
+        try:
+            text = pyperclip.paste()
+            if text:
+                return text
+        except Exception:
+            pass
+
+    if shutil.which("wl-paste"):
+        result = subprocess.run(["wl-paste", "--no-newline"], capture_output=True, text=True, check=False)
+        if result.returncode == 0 and result.stdout:
+            return result.stdout
+
+    if shutil.which("xclip"):
+        result = subprocess.run(
+            ["xclip", "-selection", "clipboard", "-o"],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode == 0 and result.stdout:
+            return result.stdout
+
+    if shutil.which("xsel"):
+        result = subprocess.run(["xsel", "--clipboard", "--output"], capture_output=True, text=True, check=False)
+        if result.returncode == 0 and result.stdout:
+            return result.stdout
+
+    return ""

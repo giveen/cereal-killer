@@ -514,6 +514,19 @@ class Brain:
 
         This path intentionally bypasses the usual conversation-history flow.
         """
+        if not snippets:
+            fallback = (
+                f"My local memory for '{query}' is a void. "
+                "Checking the IppSec and HackTricks datasets again... "
+                "or perhaps you should learn to type."
+            )
+            return BrainResponse(
+                thought="No RAG snippets available; skipped synthesis model call.",
+                answer=fallback,
+                raw_content=fallback,
+                reasoning_content="",
+            )
+
         machine_name = Path.cwd().name
         by_source: dict[str, list[RAGSnippet]] = {}
         for snippet in snippets:

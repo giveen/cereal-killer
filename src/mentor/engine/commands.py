@@ -189,18 +189,20 @@ async def _cmd_new_box(args: list[str], engine: object, settings: Settings) -> C
 async def _cmd_help(args: list[str], engine: object, settings: Settings) -> CommandResult:
     lines = [
         "[b]Available commands:[/b]",
-        "  [cyan]/box <name>[/cyan]         — Load IppSec context for a known box",
-        "  [cyan]/new-box <name>[/cyan]     — Start exploration mode for an unknown box",
-        "  [cyan]/vision[/cyan]             — Analyze latest clipboard screenshot",
-        "  [cyan]/upload <path>[/cyan]      — Analyze a specific image file",
-        "  [cyan]/loot[/cyan]               — Generate a loot report for the current box",
-        "  [cyan]/victory <text>[/cyan]     — Record post-pwn explanation in learnings vault",
-        "  [cyan]/search <query>[/cyan]     — Search local IppSec + HackTricks memory and synthesize results",
-        "  [cyan]/sync-hacktricks[/cyan]    — Ingest HackTricks library into Redis (one-time setup)",
-        "  [cyan]/sync-all[/cyan]           — Refresh all local knowledge sources from sources.yaml",
-        "  [cyan]/clear[/cyan]              — Clear the current box session from Redis",
-        "  [cyan]/exit[/cyan]               — Exit the TUI",
-        "  [cyan]/help[/cyan]               — Show this message",
+        "  [cyan]/box <name>[/cyan]              — Load IppSec context for a known box",
+        "  [cyan]/new-box <name>[/cyan]          — Start exploration mode for an unknown box",
+        "  [cyan]/vision[/cyan]                  — Analyze latest clipboard screenshot",
+        "  [cyan]/upload <path>[/cyan]           — Analyze a specific image file",
+        "  [cyan]/loot[/cyan]                    — Generate a loot report for the current box",
+        "  [cyan]/victory <text>[/cyan]          — Record post-pwn explanation in learnings vault",
+        "  [cyan]/search <query>[/cyan]          — Search local IppSec + HackTricks memory and synthesize results",
+        "  [cyan]/add-source <url>[/cyan]        — Crawl and ingest a URL into the knowledge base",
+        "  [cyan]/purge-source <fragment>[/cyan] — Delete all indexed chunks matching a URL fragment",
+        "  [cyan]/sync-hacktricks[/cyan]         — Ingest HackTricks library into Redis (one-time setup)",
+        "  [cyan]/sync-all[/cyan]                — Refresh all local knowledge sources from sources.yaml",
+        "  [cyan]/clear[/cyan]                   — Clear the current box session from Redis",
+        "  [cyan]/exit[/cyan]                    — Exit the TUI",
+        "  [cyan]/help[/cyan]                    — Show this message",
     ]
     return CommandResult(message="\n".join(lines))
 
@@ -335,6 +337,84 @@ async def _cmd_exit(args: list[str], engine: object, settings: Settings) -> Comm
     )
 
 
+async def _cmd_add_source(args: list[str], engine: object, settings: Settings) -> CommandResult:
+    """Crawl and ingest a URL into the 'webcrawl' Redis index.
+
+    Usage: /add-source <url>  [index-name]
+    The ingested content is tagged with ingested_via='add-source' for lineage tracking.
+    """
+    import asyncio
+
+    if not args:
+        return CommandResult(
+            message="[yellow]Usage:[/yellow] /add-source <url>  (e.g. /add-source https://book.hacktricks.xyz/...)"
+        )
+
+    raw_url = args[0].strip()
+    if not raw_url.startswith(("http://", "https://")):
+        return CommandResult(message="[red]Invalid URL.[/red] Must start with http:// or https://")
+
+    index_name = args[1].strip() if len(args) > 1 else "webcrawl"
+
+    asyncio.create_task(
+        _do_crawl_and_ingest(raw_url, index_name, settings)
+    )
+    return CommandResult(
+        message=(
+            f"[cyan]Crawl started for:[/cyan] {raw_url}\n"
+            f"[dim]Index: {index_name} | Tagged: ingested_via=add-source[/dim]\n"
+            "[yellow]This runs in the background — check back in 15-30 seconds.[/yellow]"
+        ),
+        session_prefix="__add_source__",
+        search_query=raw_url,
+    )
+
+
+async def _do_crawl_and_ingest(url: str, index_name: str, settings: Settings) -> None:
+    """Background task: crawl URL and store in Redis; logs but does not re-raise."""
+    import logging
+    from mentor.kb.library_ingest import crawl_and_ingest_url
+
+    log = logging.getLogger(__name__)
+    try:
+        stats = await crawl_and_ingest_url(
+            settings,
+            url,
+            index_name=index_name,
+            ingested_via="add-source",
+        )
+        log.info("add-source %s: ingested=%d failed=%d", url, stats["ingested"], stats["failed"])
+    except Exception as exc:
+        log.error("add-source crawl failed for %s: %s", url, exc)
+
+
+async def _cmd_purge_source(args: list[str], engine: object, settings: Settings) -> CommandResult:
+    """Delete all 'webcrawl' index entries whose URL contains the given fragment.
+
+    Usage: /purge-source <url-fragment>  [index-name]
+    """
+    if not args:
+        return CommandResult(
+            message="[yellow]Usage:[/yellow] /purge-source <url-or-domain>  (e.g. /purge-source hacktricks.xyz)"
+        )
+
+    fragment = args[0].strip()
+    index_name = args[1].strip() if len(args) > 1 else "webcrawl"
+
+    try:
+        from mentor.kb.library_ingest import purge_source_by_url
+        deleted = purge_source_by_url(settings, fragment, index_name=index_name)
+        if deleted:
+            return CommandResult(
+                message=f"[green]Purged {deleted} chunk(s)[/green] matching [cyan]{fragment}[/cyan] from index '{index_name}'."
+            )
+        return CommandResult(
+            message=f"[yellow]Nothing found[/yellow] matching '{fragment}' in index '{index_name}'."
+        )
+    except Exception as exc:
+        return CommandResult(message=f"[red]Purge failed:[/red] {exc}")
+
+
 async def _cmd_sync_hacktricks(args: list[str], engine: object, settings: Settings) -> CommandResult:
     """Sync and ingest HackTricks: Clone -> Parse -> Embed -> Store in Redis.
     
@@ -441,6 +521,8 @@ _REGISTRY: dict[str, _Handler] = {
     "help": _cmd_help,
     "?": _cmd_help,
     "search": _cmd_search,
+    "add-source": _cmd_add_source,
+    "purge-source": _cmd_purge_source,
     "sync-all": _cmd_sync_all,
     "sync-hacktricks": _cmd_sync_hacktricks,
 }

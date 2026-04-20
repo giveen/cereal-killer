@@ -428,6 +428,97 @@ def fetch_sync_status(settings: Settings, source_names: list[str]) -> dict[str, 
     return statuses
 
 
+async def crawl_and_ingest_url(
+    settings: Settings,
+    url: str,
+    *,
+    index_name: str = "webcrawl",
+    ingested_via: str = "manual_crawl",
+    chunk_size: int = 1000,
+    chunk_overlap: int = 100,
+) -> dict[str, int]:
+    """Crawl *url* via Crawl4AI, chunk the rag_markdown, embed, and store in Redis.
+
+    The ``ingested_via`` value is stored as lineage metadata on every chunk
+    (e.g. 'manual_crawl', 'add-source', 'searxng').
+    """
+    from cereal_killer.kb.web_crawler import crawl_url
+
+    page = await crawl_url(url, ingested_via=ingested_via)
+    text = page.rag_markdown.strip()
+    if not text:
+        return {"ingested": 0, "failed": 0}
+
+    # Split into overlapping chunks.
+    chunks: list[LibraryChunk] = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        body = text[start:end].strip()
+        if len(body) > 40:
+            chunks.append(
+                LibraryChunk(
+                    index=index_name,
+                    source=index_name,
+                    source_type="webcrawl",
+                    title=page.title or url,
+                    url=url,
+                    content=body,
+                    machine="",
+                    tags={
+                        "source": index_name,
+                        "type": "webcrawl",
+                        "ingested_via": ingested_via,
+                        "rag_source": page.rag_source,
+                    },
+                )
+            )
+        start += chunk_size - chunk_overlap
+
+    if not chunks:
+        return {"ingested": 0, "failed": 0}
+
+    fake_source = SourceConfig(
+        name=index_name,
+        index=index_name,
+        source_type="webcrawl",
+        clone_url="",
+        local_path=Path("/tmp"),
+        parse_mode="markdown",
+        content_glob="**/*.md",
+    )
+    return await ingest_chunks_for_source(settings, fake_source, chunks)
+
+
+def purge_source_by_url(
+    settings: Settings,
+    url_fragment: str,
+    *,
+    index_name: str = "webcrawl",
+) -> int:
+    """Delete all Redis hashes under *index_name* whose ``url`` contains *url_fragment*.
+
+    Returns the number of keys deleted.
+    """
+    if Redis is None:
+        return 0
+    try:
+        client = Redis.from_url(settings.redis_url, decode_responses=True)
+    except Exception:
+        return 0
+
+    deleted = 0
+    for key in client.scan_iter(match=f"{index_name}:*"):
+        try:
+            stored_url = client.hget(key, "url") or ""
+            if url_fragment.lower() in stored_url.lower():
+                client.delete(key)
+                deleted += 1
+        except Exception:
+            continue
+    return deleted
+
+
 async def sync_all_sources(settings: Settings, config_path: Path) -> dict[str, dict[str, int]]:
     sources = load_sources_config(config_path)
     summary: dict[str, dict[str, int]] = {}
