@@ -103,10 +103,10 @@ def _query_single_index(
     )
 
     docs = result if isinstance(result, list) else result.get("results", [])
-    snippets: list[RAGSnippet] = []
+    vector_snippets: list[RAGSnippet] = []
     for doc in docs:
         score = float(doc.get("vector_distance", doc.get("score", 0.0)) or 0.0)
-        snippets.append(
+        vector_snippets.append(
             RAGSnippet(
                 source=index_name,
                 machine=str(doc.get("machine", "")),
@@ -117,7 +117,207 @@ def _query_single_index(
                 phase=_extract_phase(str(doc.get("content", ""))),
             )
         )
-    return snippets
+
+    # Always run a lexical pass in parallel — hash-based embeddings carry no
+    # semantic meaning so vector KNN returns effectively random docs.  Merging
+    # lexical hits ensures keyword-relevant documents are always surfaced even
+    # when the random vector neighbours happen to be off-topic.
+    lexical_snippets = _query_single_index_lexical(
+        settings,
+        index_name,
+        query,
+        limit,
+        machine_filter=machine_filter,
+    )
+
+    # Merge: deduplicate by (source, content[:200]) keeping lexical hits (they
+    # are always relevant) and filling from vector results up to `limit`.
+    seen: set[str] = set()
+    merged: list[RAGSnippet] = []
+    for item in lexical_snippets:
+        key = f"{item.source}|{item.content[:200]}"
+        if key not in seen:
+            seen.add(key)
+            merged.append(item)
+    for item in vector_snippets:
+        key = f"{item.source}|{item.content[:200]}"
+        if key not in seen:
+            seen.add(key)
+            merged.append(item)
+
+    return merged[:limit] if merged else vector_snippets
+
+
+def _query_single_index_lexical(
+    settings: Settings,
+    index_name: str,
+    query: str,
+    limit: int,
+    *,
+    machine_filter: str | None = None,
+) -> list[RAGSnippet]:
+    try:
+        from redis import Redis
+    except Exception:
+        return []
+
+    # Allow tokens as short as 2 chars so tools like "7z", "nc", "jq" etc. match.
+    # Keep separator-bearing terms (e.g. aa-exec) and also expand them into
+    # split/compact variants to align with RediSearch tokenization.
+    raw_tokens = [tok for tok in re.findall(r"[a-z0-9_/-]+", query.lower()) if len(tok) >= 2]
+    tokens: list[str] = []
+    seen_tokens: set[str] = set()
+
+    def _add_token(value: str) -> None:
+        cleaned = (value or "").strip().lower()
+        # Keep FT.SEARCH terms syntax-safe; separators are expanded separately.
+        cleaned = re.sub(r"[^a-z0-9]+", "", cleaned)
+        if len(cleaned) < 2 or cleaned in seen_tokens:
+            return
+        seen_tokens.add(cleaned)
+        tokens.append(cleaned)
+
+    for tok in raw_tokens:
+        # Split on common separators so aa-exec -> aa, exec; /usr/bin/find -> usr, bin, find
+        for part in re.split(r"[-_/]+", tok):
+            _add_token(part)
+        # Compact variant helps with docs that normalize punctuation away.
+        compact = re.sub(r"[-_/]+", "", tok)
+        if compact != tok:
+            _add_token(compact)
+
+    if not tokens:
+        return []
+
+    # Keep query bounded and RediSearch-safe.
+    terms = tokens[:12]
+    expanded_terms: list[str] = []
+    for term in terms:
+        expanded_terms.append(term)
+        # Prefix variant helps short tool tokens (`7z`, `nc`) match title/body.
+        expanded_terms.append(f"{term}*")
+    # Preserve order while deduplicating.
+    disjunction = "|".join(dict.fromkeys(expanded_terms))
+    search_query = f"(@title:({disjunction})|@content:({disjunction}))"
+
+    target = _canonical_machine(machine_filter or "") if machine_filter else ""
+    snippets: list[RAGSnippet] = []
+    try:
+        client = Redis.from_url(settings.redis_url, decode_responses=False)
+        response = client.execute_command(
+            "FT.SEARCH",
+            index_name,
+            search_query,
+            "LIMIT",
+            "0",
+            str(max(1, limit)),
+            "RETURN",
+            "4",
+            "machine",
+            "title",
+            "url",
+            "content",
+        )
+    except Exception:
+        return []
+
+    if not isinstance(response, list) or len(response) < 3:
+        return []
+
+    def _decode(value: object) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="ignore")
+        return str(value)
+
+    for idx in range(1, len(response), 2):
+        if idx + 1 >= len(response):
+            break
+        fields = response[idx + 1]
+        if not isinstance(fields, list):
+            continue
+        payload: dict[str, str] = {}
+        for pos in range(0, len(fields), 2):
+            if pos + 1 >= len(fields):
+                break
+            payload[_decode(fields[pos])] = _decode(fields[pos + 1])
+
+        machine = payload.get("machine", "")
+        if target and _canonical_machine(machine) != target:
+            continue
+
+        content = payload.get("content", "")
+        snippets.append(
+            RAGSnippet(
+                source=index_name,
+                machine=machine,
+                title=payload.get("title", ""),
+                url=payload.get("url", ""),
+                content=content,
+                # Pseudo-distance for lexical fallback keeps similarity moderate.
+                score=0.55,
+                phase=_extract_phase(content),
+            )
+        )
+
+    # GTFOBins entries are often keyed by exact command title; perform a
+    # title-only rescue query when generic lexical search still yields nothing.
+    if not snippets and index_name.lower() == "gtfobins":
+        for term in terms:
+            try:
+                exact_response = client.execute_command(
+                    "FT.SEARCH",
+                    index_name,
+                    f'@title:("{term}")',
+                    "LIMIT",
+                    "0",
+                    str(max(1, limit)),
+                    "RETURN",
+                    "4",
+                    "machine",
+                    "title",
+                    "url",
+                    "content",
+                )
+            except Exception:
+                continue
+
+            if not isinstance(exact_response, list) or len(exact_response) < 3:
+                continue
+
+            for pos in range(1, len(exact_response), 2):
+                if pos + 1 >= len(exact_response):
+                    break
+                fields = exact_response[pos + 1]
+                if not isinstance(fields, list):
+                    continue
+                payload: dict[str, str] = {}
+                for fpos in range(0, len(fields), 2):
+                    if fpos + 1 >= len(fields):
+                        break
+                    payload[_decode(fields[fpos])] = _decode(fields[fpos + 1])
+
+                machine = payload.get("machine", "")
+                if target and _canonical_machine(machine) != target:
+                    continue
+
+                content = payload.get("content", "")
+                snippets.append(
+                    RAGSnippet(
+                        source=index_name,
+                        machine=machine,
+                        title=payload.get("title", ""),
+                        url=payload.get("url", ""),
+                        content=content,
+                        score=0.55,
+                        phase=_extract_phase(content),
+                    )
+                )
+            if snippets:
+                break
+
+    return snippets[:limit]
 
 
 def _extract_phase(text: str) -> str:
@@ -185,8 +385,10 @@ def _get_cross_encoder() -> Any | None:
 
 
 def _lexical_rerank_score(query: str, snippet: RAGSnippet) -> float:
-    q_tokens = {tok for tok in re.findall(r"[a-z0-9_/-]+", query.lower()) if len(tok) > 2}
-    s_tokens = set(re.findall(r"[a-z0-9_/-]+", snippet.content.lower()))
+    # Keep 2-char tokens so tool names like `7z`, `nc`, `jq`, `id` are scored.
+    q_tokens = {tok for tok in re.findall(r"[a-z0-9_/-]+", query.lower()) if len(tok) >= 2}
+    haystack = "\n".join([snippet.title or "", snippet.machine or "", snippet.content or ""])
+    s_tokens = set(re.findall(r"[a-z0-9_/-]+", haystack.lower()))
     if not q_tokens or not s_tokens:
         return 0.0
     overlap = len(q_tokens & s_tokens)
@@ -272,6 +474,7 @@ def _rerank_snippets(query: str, snippets: list[RAGSnippet], phase_bucket: str, 
 
         # Intent-aware source boost for common priv-esc search phrases.
         q = query.lower()
+        q_tokens = {tok for tok in re.findall(r"[a-z0-9_/-]+", q) if len(tok) >= 2}
         source = (item.source or "").lower()
         source_bonus = 0.0
         if ("find" in q and "suid" in q) or "setuid" in q or "sudo -l" in q:
@@ -279,6 +482,12 @@ def _rerank_snippets(query: str, snippets: list[RAGSnippet], phase_bucket: str, 
                 source_bonus += 0.25
             if source == "hacktricks":
                 source_bonus += 0.22
+
+        # Tool-name lookups (e.g. `7z`, `nc`, `awk`) should strongly favor
+        # GTFOBins when available.
+        short_tool_query = len(q_tokens) == 1 and len(next(iter(q_tokens), "")) <= 4
+        if short_tool_query and source == "gtfobins":
+            source_bonus += 0.45
 
         return (
             (0.65 * item.rerank_score)
@@ -289,6 +498,31 @@ def _rerank_snippets(query: str, snippets: list[RAGSnippet], phase_bucket: str, 
         )
 
     return sorted(filtered, key=_rank, reverse=True)
+
+
+def _select_diverse_snippets(reranked: list[RAGSnippet], top_k: int) -> list[RAGSnippet]:
+    """Prefer source diversity first, then fill by rank."""
+    if top_k <= 0 or not reranked:
+        return []
+
+    selected: list[RAGSnippet] = []
+    seen_sources: set[str] = set()
+
+    for item in reranked:
+        if item.source in seen_sources:
+            continue
+        selected.append(item)
+        seen_sources.add(item.source)
+        if len(selected) >= top_k:
+            return selected
+
+    for item in reranked:
+        if item in selected:
+            continue
+        selected.append(item)
+        if len(selected) >= top_k:
+            break
+    return selected
 
 
 def _canonical_machine(value: str) -> str:
@@ -418,7 +652,7 @@ def retrieve_reference_material(
                     break
             if unique_hits:
                 reranked = _rerank_snippets(command_or_prompt, unique_hits, phase_bucket, recent_fingerprints)
-                selected = reranked[:top_k]
+                selected = _select_diverse_snippets(reranked, top_k)
                 _LOG.info(
                     "RAG top-3 similarity (%s): %s",
                     command_or_prompt,
@@ -447,7 +681,7 @@ def retrieve_reference_material(
         machine_matches = [item for item in combined if _canonical_machine(item.machine) == target]
         if machine_matches:
             reranked = _rerank_snippets(command_or_prompt, machine_matches, phase_bucket, recent_fingerprints)
-            selected = reranked[:top_k]
+            selected = _select_diverse_snippets(reranked, top_k)
             _LOG.info(
                 "RAG top-3 similarity (%s): %s",
                 command_or_prompt,
@@ -457,7 +691,7 @@ def retrieve_reference_material(
             return selected
 
     reranked = _rerank_snippets(command_or_prompt, combined, phase_bucket, recent_fingerprints)
-    selected = reranked[:top_k]
+    selected = _select_diverse_snippets(reranked, top_k)
     _LOG.info(
         "RAG top-3 similarity (%s): %s",
         command_or_prompt,

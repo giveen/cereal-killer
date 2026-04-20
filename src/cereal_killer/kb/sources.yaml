@@ -21,7 +21,7 @@ sources:
     clone_url: https://github.com/GTFOBins/GTFOBins.github.io.git
     local_path: ~/.cache/gibson-library/gtfobins
     parse_mode: gtfobins
-    content_glob: '_gtfobins/*.{md,yml,yaml}'
+    content_glob: '_gtfobins/*'
 
   - name: lolbas
     index: lolbas

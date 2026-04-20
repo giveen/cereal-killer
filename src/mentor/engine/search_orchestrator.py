@@ -35,6 +35,19 @@ _DEFAULT_VECTOR_THRESHOLD = RAG_NOT_EMPTY_SIMILARITY_THRESHOLD
 _DEFAULT_INDEX_PRIORITY = ["ippsec", "gtfobins", "lolbas", "hacktricks", "payloads"]
 
 
+def _resolve_index_priority(settings: Settings) -> list[str]:
+    """Return index order with configured Redis index guaranteed to be included.
+
+    This prevents silent empty retrievals when REDIS_INDEX differs from legacy
+    hardcoded names (e.g., `ippsec_idx`).
+    """
+    configured = (settings.redis_index or "").strip()
+    ordered = [*_DEFAULT_INDEX_PRIORITY]
+    if configured and configured not in ordered:
+        ordered.append(configured)
+    return ordered
+
+
 @dataclass(slots=True)
 class SearchResult:
     """Unified result from the tiered search pipeline."""
@@ -103,7 +116,7 @@ async def tiered_search(
         context_commands=history_commands,
         top_k=top_k,
         target_machine=target_machine,
-        index_order=_DEFAULT_INDEX_PRIORITY,
+        index_order=_resolve_index_priority(settings),
         source_filters=source_filters,
     )
     best_score = _best_vector_score(vector_snippets)

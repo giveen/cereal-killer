@@ -12,7 +12,7 @@ from textual import on
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, DirectoryTree, Input, LoadingIndicator, Markdown, OptionList, Static
+from textual.widgets import Button, DirectoryTree, Footer, Input, LoadingIndicator, Markdown, OptionList, Rule, Static
 
 from mentor.utils.clipboard import copy_text
 
@@ -165,6 +165,13 @@ class MainDashboard(Screen[None]):
         self._last_response_raw = ""
         self._last_response_markdown = ""
         self._active_view = "chat"
+        self._gibson_group_collapsed: dict[str, bool] = {}
+        self._gibson_option_rows: list[dict[str, object]] = []
+        self._gibson_all_snippets: list[dict] = []
+
+    async def on_mount(self) -> None:
+        """Initialize display state to show chat view."""
+        self.set_active_view("chat")
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dashboard"):
@@ -175,7 +182,7 @@ class MainDashboard(Screen[None]):
                 yield Button("Gibson", id="tab_gibson", variant="default")
             with Horizontal(id="main_row"):
                 with Vertical(id="explorer_pane"):
-                    with Horizontal(id="ingest_icon_row"):
+                    with Vertical(id="ingest_icon_row"):
                         yield Button("📸", id="open_image_ingest", variant="default")
                         yield Button("📄", id="open_document_ingest", variant="default")
                     screenshots_dir = Path("/screenshots") if Path("/screenshots").exists() else Path.cwd()
@@ -198,6 +205,7 @@ class MainDashboard(Screen[None]):
                         placeholder="Search local RAG (HackTricks, IppSec, Payloads)…",
                         id="gibson_search_input",
                     )
+                    yield Rule(id="gibson_rule")
                     with Horizontal(id="gibson_split"):
                         with VerticalScroll(id="gibson_list_pane"):
                             yield OptionList(id="gibson_result_list")
@@ -216,7 +224,7 @@ class MainDashboard(Screen[None]):
                         yield LoadingIndicator(id="gibson_loading")
             with Horizontal(id="bottom_row"):
                 yield CommandInput()
-            yield Static("RAM --.-/--.-GB | 5090 --C", id="system_footer")
+            yield Footer()
 
     def chat_log(self) -> VerticalScroll:
         return self.query_one("#chat_log", VerticalScroll)
@@ -250,7 +258,7 @@ class MainDashboard(Screen[None]):
             "phase-post",
         ):
             phase_widget.remove_class(cls)
-        phase_widget.update(f"CURRENT PHASE\n{phase}")
+        phase_widget.update(f"PHASE: {phase}")
         if phase == "[RECON]":
             phase_widget.add_class("phase-recon")
         elif phase == "[ENUMERATION]":
@@ -263,16 +271,31 @@ class MainDashboard(Screen[None]):
             phase_widget.add_class("phase-idle")
 
     def set_active_tool(self, tool_name: str) -> None:
-        self.query_one("#active_tool", Static).update(f"ACTIVE TOOL\n{tool_name}")
+        self.query_one("#active_tool", Static).update(f"TOOL: {tool_name}")
 
     def set_visual_buffer(self, description: str, preview: str = "") -> None:
-        body = description.strip() or "clipboard_obs.png"
-        if preview.strip():
-            body = f"{body}\n{preview}"
-        self.query_one("#visual_buffer", Static).update(body)
+        # Legacy compatibility shim; use set_visual_buffer_image for real image rendering.
+        sidebar = self.query_one("#intel_sidebar", SidebarStatus)
+        sidebar.set_remote_image_candidate(description if description.startswith(("http://", "https://")) else None)
+
+    def set_visual_buffer_image(self, image_path: Path, *, source: str, preview: str = "") -> None:
+        sidebar = self.query_one("#intel_sidebar", SidebarStatus)
+        sidebar.set_visual_buffer_image(image_path, source=source, preview=preview)
+
+    def set_remote_image_candidate(self, url: str | None) -> None:
+        sidebar = self.query_one("#intel_sidebar", SidebarStatus)
+        sidebar.set_remote_image_candidate(url)
+
+    def get_remote_image_candidate(self) -> str | None:
+        sidebar = self.query_one("#intel_sidebar", SidebarStatus)
+        return sidebar.get_remote_image_candidate()
+
+    def get_visual_buffer_image_path(self) -> Path | None:
+        sidebar = self.query_one("#intel_sidebar", SidebarStatus)
+        return sidebar.get_visual_buffer_image_path()
 
     def clear_visual_buffer(self) -> None:
-        self.query_one("#visual_buffer", Static).update("clipboard_obs.png\n(waiting for screenshot)")
+        self.query_one("#intel_sidebar", SidebarStatus).clear_visual_buffer()
 
     def set_pathetic_meter(self, value: int) -> None:
         self.query_one("#pathetic_meter_bar", VerticalProgressBar).set_value(value)
@@ -286,6 +309,10 @@ class MainDashboard(Screen[None]):
     def set_knowledge_sync_status(self, statuses: dict[str, str]) -> None:
         sidebar = self.query_one("#intel_sidebar", SidebarStatus)
         sidebar.set_knowledge_sync_status(statuses)
+
+    def set_github_api_status(self, summary: str) -> None:
+        sidebar = self.query_one("#intel_sidebar", SidebarStatus)
+        sidebar.set_github_api_status(summary)
 
     async def pulse_terminal_link(self) -> None:
         """Pulse the terminal link indicator to show data is flowing."""
@@ -412,6 +439,7 @@ class MainDashboard(Screen[None]):
         left_pane = self.query_one("#left_pane", Vertical)
         sidebar = self.query_one("#intel_sidebar", SidebarStatus)
         gibson_pane = self.query_one("#gibson_pane", Vertical)
+        bottom_row = self.query_one("#bottom_row", Horizontal)
         tab_chat = self.query_one("#tab_chat", Button)
         tab_ops = self.query_one("#tab_ops", Button)
         tab_gibson = self.query_one("#tab_gibson", Button)
@@ -423,6 +451,7 @@ class MainDashboard(Screen[None]):
             left_pane.styles.display = "none"
             sidebar.styles.display = "block"
             gibson_pane.styles.display = "none"
+            bottom_row.styles.display = "block"
             self._set_tab_states(tab_chat, tab_ops, tab_gibson, active="ops")
         elif view == "gibson":
             self._active_view = "gibson"
@@ -430,6 +459,7 @@ class MainDashboard(Screen[None]):
             left_pane.styles.display = "none"
             sidebar.styles.display = "none"
             gibson_pane.styles.display = "block"
+            bottom_row.styles.display = "none"
             self._set_tab_states(tab_chat, tab_ops, tab_gibson, active="gibson")
         else:
             self._active_view = "chat"
@@ -437,13 +467,14 @@ class MainDashboard(Screen[None]):
             left_pane.styles.display = "block"
             sidebar.styles.display = "none"
             gibson_pane.styles.display = "none"
+            bottom_row.styles.display = "block"
             self._set_tab_states(tab_chat, tab_ops, tab_gibson, active="chat")
 
         # Brief tint pulse to mimic CRT refresh when changing views.
         self.add_class("crt-refresh")
         self.set_timer(0.12, lambda: self.remove_class("crt-refresh"))
         main_row.styles.opacity = 0.92
-        main_row.animate("opacity", 1.0, duration=0.16)
+        main_row.styles.animate("opacity", 1.0, duration=0.16)
 
     @on(Button.Pressed, "#tab_gibson")
     def show_gibson_view(self) -> None:
@@ -451,15 +482,12 @@ class MainDashboard(Screen[None]):
     # ── Gibson helpers ──────────────────────────────────────────────────────
 
     def set_gibson_results(self, snippets: list[dict]) -> None:
-        """Populate the OptionList with snippet titles and show the first."""
-        option_list = self.query_one("#gibson_result_list", OptionList)
+        """Populate grouped Gibson results with collapsible title groups."""
         list_pane = self.query_one("#gibson_list_pane", VerticalScroll)
         viewer_pane = self.query_one("#gibson_viewer_pane", VerticalScroll)
-        option_list.clear_options()
-        for snippet in snippets:
-            source_label = f"[{snippet.get('source', '?')}]"
-            title = (snippet.get("title") or "")[:55]
-            option_list.add_option(f"{source_label} {title}".strip())
+        self._gibson_all_snippets = list(snippets)
+        self._render_gibson_grouped_options()
+
         if snippets:
             self.show_gibson_snippet(snippets[0])
         else:
@@ -468,8 +496,64 @@ class MainDashboard(Screen[None]):
         # Fade-in animation for new Gibson results.
         list_pane.styles.opacity = 0.0
         viewer_pane.styles.opacity = 0.0
-        list_pane.animate("opacity", 1.0, duration=0.24)
-        viewer_pane.animate("opacity", 1.0, duration=0.24)
+        list_pane.styles.animate("opacity", 1.0, duration=0.24)
+        viewer_pane.styles.animate("opacity", 1.0, duration=0.24)
+
+    def _render_gibson_grouped_options(self) -> None:
+        option_list = self.query_one("#gibson_result_list", OptionList)
+        option_list.clear_options()
+        self._gibson_option_rows = []
+
+        grouped: dict[str, list[dict]] = {}
+        for snippet in self._gibson_all_snippets:
+            title = (snippet.get("title") or "untitled").strip() or "untitled"
+            key = title.lower()
+            grouped.setdefault(key, []).append(snippet)
+
+        for group_key, members in sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0])):
+            title = (members[0].get("title") or "untitled").strip() or "untitled"
+            collapsed = self._gibson_group_collapsed.get(group_key, False)
+            marker = "▶" if collapsed else "▼"
+            by_source: dict[str, int] = {}
+            for member in members:
+                source = str(member.get("source") or "?").strip().lower()
+                by_source[source] = by_source.get(source, 0) + 1
+            source_mix = ", ".join(
+                f"{name}:{count}"
+                for name, count in sorted(by_source.items(), key=lambda item: (-item[1], item[0]))
+            )
+            label = f"{marker} {title[:40]} ({len(members)}) [{source_mix}]"
+            option_list.add_option(label)
+            self._gibson_option_rows.append({"kind": "group", "group": group_key})
+
+            if collapsed:
+                continue
+
+            for snippet in members:
+                source = str(snippet.get("source") or "?")
+                source_label = source[:16]
+                machine = str(snippet.get("machine") or "").strip()
+                display = machine[:40] if machine else title[:40]
+                option_list.add_option(f"   • [{source_label}] {display}")
+                self._gibson_option_rows.append({"kind": "item", "snippet": snippet, "group": group_key})
+
+    def resolve_gibson_selection(self, option_index: int) -> dict | None:
+        if option_index < 0 or option_index >= len(self._gibson_option_rows):
+            return None
+        row = self._gibson_option_rows[option_index]
+        kind = str(row.get("kind", ""))
+        if kind == "item":
+            snippet = row.get("snippet")
+            return snippet if isinstance(snippet, dict) else None
+
+        if kind == "group":
+            group = str(row.get("group", ""))
+            self._gibson_group_collapsed[group] = not self._gibson_group_collapsed.get(group, False)
+            self._render_gibson_grouped_options()
+        return None
+
+    def show_gibson_summary(self, markdown_text: str) -> None:
+        self.query_one("#gibson_viewer", Markdown).update(markdown_text)
 
     def show_gibson_snippet(self, snippet: dict) -> None:
         self.query_one("#gibson_viewer", Markdown).update(
@@ -482,8 +566,8 @@ class MainDashboard(Screen[None]):
     def focus_gibson_input(self) -> None:
         self.query_one("#gibson_search_input", Input).focus()
 
-    def set_system_footer(self, text: str) -> None:
-        self.query_one("#system_footer", Static).update(text)
+    def focus_chat_input(self) -> None:
+        self.query_one("#command_input", Input).focus()
 
     @staticmethod
     def _set_tab_states(tab_chat: Button, tab_ops: Button, tab_gibson: Button, *, active: str) -> None:
@@ -502,6 +586,7 @@ class MainDashboard(Screen[None]):
         title = snippet.get("title", "")
         source = snippet.get("source", "")
         url = snippet.get("url", "")
+        visual_image_url = snippet.get("visual_image_url", "")
         content = snippet.get("content", "")
         if title:
             parts.append(f"# {title}")
@@ -509,9 +594,28 @@ class MainDashboard(Screen[None]):
             parts.append(f"> **Source:** {source}")
         if url:
             parts.append(f"> **URL:** [{url}]({url})")
+        if visual_image_url:
+            token = quote(str(visual_image_url), safe="")
+            parts.append(f"> [VIEW IMAGE](view-image://{token})")
         parts.append("")
         parts.append(content)
         return "\n".join(parts)
+
+    @on(Markdown.LinkClicked, "#gibson_viewer")
+    def on_gibson_link_clicked(self, event: Markdown.LinkClicked) -> None:
+        href = event.href.strip()
+        if href.startswith(("http://", "https://")):
+            webbrowser.open(href)
+            return
+        if not href.startswith("view-image://"):
+            return
+        encoded = href.replace("view-image://", "", 1)
+        remote_url = unquote(encoded).strip()
+        if not remote_url:
+            return
+        loader = getattr(self.app, "queue_remote_visual_url", None)
+        if callable(loader):
+            loader(remote_url)
 
 
     def _update_response_markdown(self, text: str) -> None:

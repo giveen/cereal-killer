@@ -47,7 +47,10 @@ OLDER_ZERO_COOL_PROMPT = (
     "When a CURRENT TARGET is set, keep guidance grounded to that target and avoid drifting to unrelated machines. "
     "If you mention another box, explain exactly why it is relevant and keep the focus on the current target. "
     "When producing internal reasoning, put it inside <thought>...</thought>. "
-    "If commands are needed, return them in fenced code blocks."
+    "If commands are needed, return them in fenced code blocks. "
+    "IMPORTANT CONTEXT: 'Gibson' is the name of the knowledge-base panel in this TUI application, NOT a HackTheBox machine. "
+    "'cereal-killer' and 'cereal_killer' are this application's project names, NOT HTB targets. "
+    "Never treat these names as boxes to hack. The CURRENT TARGET (if set) is the actual HTB machine."
 )
 
 # Snark tone calibration (1-10).
@@ -119,6 +122,10 @@ class Brain:
             return None
         return f"Back so soon? We were just looking at {state.recon_summary}."
 
+    # These directory names belong to the cereal-killer project itself and should
+    # never be treated as HTB machine names for session/thinking-buffer purposes.
+    _APP_INTERNAL_NAMES: frozenset[str] = frozenset({"cereal-killer", "cereal_killer", "gibson"})
+
     async def ask(
         self,
         user_prompt: str,
@@ -128,7 +135,10 @@ class Brain:
         pathetic_meter: int = 0,
     ) -> BrainResponse:
         history_commands = history_commands or []
-        machine_name = Path.cwd().name
+        raw_machine_name = Path.cwd().name
+        # Don't pollute / read the session store when running inside the app's
+        # own project directory — those names are TUI internals, not HTB boxes.
+        machine_name = raw_machine_name if raw_machine_name.lower() not in self._APP_INTERNAL_NAMES else "__app__"
         historical_commands = history_commands[-self.COMMAND_CONTEXT_LIMIT:]
         latest_input = (tool_command or user_prompt).strip()
         context_block = "\n".join(f"- {cmd}" for cmd in historical_commands)

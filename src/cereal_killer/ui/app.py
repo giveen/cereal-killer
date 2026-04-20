@@ -8,7 +8,9 @@ import shutil
 import subprocess
 import time as _time
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
+from urllib.parse import urlparse
 
 from textual import on, work
 from textual.app import App
@@ -16,8 +18,11 @@ from textual.css.query import NoMatches
 from textual.events import Resize
 from textual.widgets import Button, DirectoryTree, Input, Markdown, OptionList
 
+import httpx
+
 from cereal_killer.engine import LLMEngine
 from cereal_killer.ingest_logic import build_document_prompt, is_document_path, is_image_path
+from cereal_killer.kb.cve_jit import extract_cve_ids, fetch_cve, get_rate_snapshot
 from cereal_killer.knowledge_base import KnowledgeBase
 from cereal_killer.observer import (
     ClipboardImageDetected,
@@ -41,6 +46,7 @@ from .widgets import PulsingEasyButton
 _AUTO_COACH_COOLDOWN_SECS = 10
 CODE_BLOCK_PATTERN = re.compile(r"```(?:[a-zA-Z0-9_+-]+)?\n(.*?)```", re.DOTALL)
 SEARCH_SOURCE_FILTER_RE = re.compile(r"\bonly\s+(ippsec|gtfobins|lolbas|hacktricks|payloads)\b", re.IGNORECASE)
+IMAGE_URL_RE = re.compile(r"https?://[^\s\]\)>'\"]+\.(?:png|jpg|jpeg|webp|bmp|gif)(?:\?[^\s\]\)>'\"]*)?", re.IGNORECASE)
 VISION_BUFFER_PATH = Path("data/temp/clipboard_obs.png")
 VISION_PROMPT = (
     "Zero Cool, I've just pasted a screenshot. "
@@ -52,12 +58,13 @@ _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 class CerealKillerApp(App[None]):
     CSS_PATH = Path(__file__).with_name("styles.tcss")
     BINDINGS = [
-        ("ctrl+c", "quit", "Quit"),
-        ("ctrl+b", "pulse_easy_button", "Easy Button"),
-        ("u", "toggle_upload_tree", "Toggle Upload Tree"),
-        ("ctrl+o", "show_ops_view", "Ops View"),
-        ("ctrl+g", "focus_gibson", "Gibson Search"),
-        ("f3", "focus_gibson", "Gibson Search"),
+        ("q", "quit", "Quit"),
+        ("f1", "show_chat_view", "Chat"),
+        ("f2", "show_ops_view", "Ops"),
+        ("f3", "focus_gibson", "Gibson"),
+        ("s", "sync_all", "Sync"),
+        ("ctrl+b", "toggle_sidebar", "Sidebar"),
+        ("ctrl+u", "open_upload_modal", "Upload"),
     ]
 
     def __init__(self, engine: LLMEngine, kb: KnowledgeBase) -> None:
@@ -80,6 +87,7 @@ class CerealKillerApp(App[None]):
         self._analysis_jobs = 0
         self._uploaded_image_path: Path | None = None
         self._gibson_snippets: list[dict] = []
+        self._vision_analyzed_sources: set[str] = set()
 
     def _dashboard(self) -> MainDashboard:
         screen = self.screen
@@ -95,16 +103,17 @@ class CerealKillerApp(App[None]):
         dashboard.set_phase("[IDLE]")
         dashboard.set_upload_root(Path.cwd())
         dashboard.set_loading(False)
+        dashboard.focus_chat_input()
         self.set_interval(0.7, self._pulse_easy_button)
         self.set_interval(300, self._schedule_persist_mental_state)
         self.set_interval(60, self._schedule_context_prune)
         self.set_interval(60, self._refresh_knowledge_sync_status)
-        self.set_interval(2.0, self._refresh_system_footer)
+        self.set_interval(15, self._refresh_github_api_status)
         self.observer_task = asyncio.create_task(self._observe())
         self.clipboard_task = asyncio.create_task(self._watch_clipboard())
         asyncio.create_task(self._run_boot_sequence())
         self._refresh_knowledge_sync_status()
-        self._refresh_system_footer()
+        self._refresh_github_api_status()
         if hasattr(self.engine, "set_web_search_callback"):
             self.engine.set_web_search_callback(self._on_web_search_state)
 
@@ -153,6 +162,25 @@ class CerealKillerApp(App[None]):
     def action_show_ops_view(self) -> None:
         self._dashboard().set_active_view("ops")
 
+    def action_show_chat_view(self) -> None:
+        dashboard = self._dashboard()
+        dashboard.set_active_view("chat")
+        dashboard.focus_chat_input()
+
+    def action_toggle_sidebar(self) -> None:
+        dashboard = self._dashboard()
+        sidebar = dashboard.query_one("#intel_sidebar")
+        if sidebar.styles.display == "none":
+            dashboard.set_active_view("ops")
+        else:
+            dashboard.set_active_view("chat")
+
+    def action_sync_all(self) -> None:
+        asyncio.create_task(self._handle_command("/sync-all"))
+
+    def action_open_upload_modal(self) -> None:
+        self._open_ingest_modal("document")
+
     def action_open_image_ingest(self) -> None:
         self._open_ingest_modal("image")
 
@@ -164,6 +192,14 @@ class CerealKillerApp(App[None]):
         dashboard.set_active_view("gibson")
         dashboard.focus_gibson_input()
 
+    def queue_remote_visual_url(self, url: str) -> None:
+        """Handle inline Gibson [VIEW IMAGE] links."""
+        cleaned = (url or "").strip()
+        if not cleaned:
+            return
+        self._dashboard().set_remote_image_candidate(cleaned)
+        self._run_remote_visual_worker(cleaned)
+
     @on(Input.Submitted, "#gibson_search_input")
     def on_gibson_search_submitted(self, event: Input.Submitted) -> None:
         query = event.value.strip()
@@ -173,9 +209,9 @@ class CerealKillerApp(App[None]):
 
     @on(OptionList.OptionSelected, "#gibson_result_list")
     def on_gibson_result_selected(self, event: OptionList.OptionSelected) -> None:
-        idx = event.option_index
-        if 0 <= idx < len(self._gibson_snippets):
-            self._dashboard().show_gibson_snippet(self._gibson_snippets[idx])
+        snippet = self._dashboard().resolve_gibson_selection(event.option_index)
+        if snippet is not None:
+            self._dashboard().show_gibson_snippet(snippet)
 
     @on(Button.Pressed, "#gibson_synthesize")
     def on_gibson_synthesize_pressed(self) -> None:
@@ -187,6 +223,30 @@ class CerealKillerApp(App[None]):
             )
             return
         self._run_gibson_synthesize_worker()
+
+    @on(Button.Pressed, "#visual_view_remote")
+    def on_visual_view_remote_pressed(self) -> None:
+        url = self._dashboard().get_remote_image_candidate()
+        if not url:
+            self.notify("No remote diagram is queued.", title="Visual Buffer", severity="warning")
+            return
+        self._run_remote_visual_worker(url)
+
+    @on(Button.Pressed, "#visual_send_zero_cool")
+    def on_visual_send_zero_cool_pressed(self) -> None:
+        image_path = self._dashboard().get_visual_buffer_image_path()
+        if image_path is None:
+            self.notify("Load an image first.", title="Visual Buffer", severity="warning")
+            return
+        source_key = str(image_path.expanduser().resolve())
+        if source_key in self._vision_analyzed_sources:
+            self.notify(
+                "Zero Cool already analyzed this frame.",
+                title="Visual Buffer",
+                severity="information",
+            )
+            return
+        self._run_vision_worker(str(image_path), source_label="Visual Buffer")
 
     async def _handle_command(self, prompt: str) -> None:
         dashboard = self._dashboard()
@@ -230,12 +290,19 @@ class CerealKillerApp(App[None]):
                     title="Add Source",
                     severity="information",
                 )
+                if self._looks_like_image_url(result.search_query):
+                    dashboard.set_remote_image_candidate(result.search_query)
+                    dashboard.append_system(
+                        "Crawl source includes an image. Use [VIEW IMAGE] in the Media Drawer.",
+                        style="bold cyan",
+                    )
             return
 
         dashboard.set_active_tool("Idle")
 
     @work(exclusive=True, thread=False, group="llm")
     async def _run_chat_worker(self, prompt: str) -> None:
+        import asyncio as _asyncio
         dashboard = self._dashboard()
         self._analysis_busy(True)
         dashboard.set_active_tool("Brain")
@@ -250,6 +317,8 @@ class CerealKillerApp(App[None]):
             dashboard.set_phase(phase)
             if "pwned" in prompt.lower() or "owned" in prompt.lower():
                 self._save_session_snapshot("pwned-manual")
+        except _asyncio.CancelledError:
+            raise
         except Exception as exc:
             dashboard.append_system(f"LLM error: {exc}", style="red")
         finally:
@@ -303,6 +372,7 @@ class CerealKillerApp(App[None]):
                 pathetic_meter=self.pathetic_meter,
             )
             await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
+            self._vision_analyzed_sources.add(str(image_file.expanduser().resolve()))
             if mark_context:
                 dashboard.set_upload_progress(100, "IMAGE INGEST")
         except Exception as exc:
@@ -346,7 +416,7 @@ class CerealKillerApp(App[None]):
             dashboard.set_active_tool("Idle")
             self._analysis_busy(False)
 
-    @work(exclusive=True, thread=False, group="llm")
+    @work(exclusive=True, thread=False, group="coach")
     async def _run_autocoach_worker(self, command: str) -> None:
         dashboard = self._dashboard()
         self._analysis_busy(True)
@@ -384,7 +454,7 @@ class CerealKillerApp(App[None]):
                 target_machine=None,
                 allow_web=False,
                 force_web=False,
-                top_k=6,
+                top_k=12,
                 source_filters=source_filters,
             )
             chunks = search_result.vector_snippets
@@ -404,6 +474,7 @@ class CerealKillerApp(App[None]):
                 response = await self.engine.synthesize_search_results(query, chunks)
                 labeled_answer = f"## [SEARCH RESULT]\n\n{response.answer.strip()}"
                 await self._consume_llm_response(labeled_answer, response.reasoning_content or response.thought)
+                dashboard.show_gibson_summary(f"# GIBSON SUMMARY\n\n{response.answer.strip()}")
             else:
                 fallback = (
                     f"My local memory for '{query}' is a void. "
@@ -414,10 +485,21 @@ class CerealKillerApp(App[None]):
                 self._append_chat("assistant", fallback)
 
             # Populate Gibson tab with raw snippets and switch to it.
-            self._gibson_snippets = [
-                {"title": s.title, "content": s.content, "source": s.source, "url": s.url}
-                for s in chunks
-            ]
+            self._gibson_snippets = []
+            for snippet in chunks:
+                row = {
+                    "title": snippet.title,
+                    "content": snippet.content,
+                    "source": snippet.source,
+                    "machine": snippet.machine,
+                    "url": snippet.url,
+                }
+                row["visual_image_url"] = self._extract_visual_candidate_url([row])
+                self._gibson_snippets.append(row)
+            remote_candidate = self._extract_visual_candidate_url(self._gibson_snippets)
+            dashboard.set_remote_image_candidate(remote_candidate)
+            if remote_candidate:
+                dashboard.append_system("Relevant diagram found. Use [VIEW IMAGE] in the Media Drawer.", style="bold cyan")
             dashboard.set_gibson_results(self._gibson_snippets)
             dashboard.set_active_view("gibson")
         except Exception as exc:
@@ -435,10 +517,11 @@ class CerealKillerApp(App[None]):
 
     @work(exclusive=False, thread=False, group="search")
     async def _run_gibson_search_worker(self, query: str) -> None:
-        """Direct search from the Gibson tab — no LLM synthesis, just raw snippets."""
+        """Direct search from the Gibson tab with grouped results + auto summary."""
         dashboard = self._dashboard()
         dashboard.set_gibson_loading(True)
         dashboard.set_active_tool("Gibson")
+        self._analysis_busy(True)
         try:
             source_filters = self._extract_source_filters(query)
             search_result = await tiered_search(
@@ -448,7 +531,7 @@ class CerealKillerApp(App[None]):
                 target_machine=None,
                 allow_web=False,
                 force_web=False,
-                top_k=8,
+                top_k=15,
                 source_filters=source_filters,
             )
             top_scores = ", ".join(f"{score:.3f}" for score in search_result.top_similarity_scores) or "none"
@@ -457,11 +540,40 @@ class CerealKillerApp(App[None]):
                 f"Gibson found {len(search_result.vector_snippets)} relevant matches in local memory.",
                 style="bold green",
             )
-            self._gibson_snippets = [
-                {"title": s.title, "content": s.content, "source": s.source, "url": s.url}
-                for s in search_result.vector_snippets
-            ]
+            self._gibson_snippets = []
+            for snippet in search_result.vector_snippets:
+                row = {
+                    "title": snippet.title,
+                    "content": snippet.content,
+                    "source": snippet.source,
+                    "machine": snippet.machine,
+                    "url": snippet.url,
+                }
+                row["visual_image_url"] = self._extract_visual_candidate_url([row])
+                self._gibson_snippets.append(row)
+            remote_candidate = self._extract_visual_candidate_url(self._gibson_snippets)
+            dashboard.set_remote_image_candidate(remote_candidate)
+            if remote_candidate:
+                dashboard.append_system("Relevant diagram found. Use [VIEW IMAGE] in the Media Drawer.", style="bold cyan")
             dashboard.set_gibson_results(self._gibson_snippets)
+
+            if self._gibson_snippets:
+                from mentor.kb.query import RAGSnippet
+
+                rag_snippets = [
+                    RAGSnippet(
+                        source=s.get("source", ""),
+                        machine=s.get("machine", ""),
+                        title=s.get("title", ""),
+                        url=s.get("url", ""),
+                        content=s.get("content", ""),
+                        score=0.0,
+                    )
+                    for s in self._gibson_snippets
+                ]
+                response = await self.engine.synthesize_search_results(query, rag_snippets)
+                summary = f"# GIBSON SUMMARY\n\n{response.answer.strip()}"
+                dashboard.show_gibson_summary(summary)
         except Exception as exc:
             try:
                 dashboard.query_one("#gibson_viewer", Markdown).update(f"_Search error: {exc}_")
@@ -470,6 +582,7 @@ class CerealKillerApp(App[None]):
         finally:
             dashboard.set_active_tool("Idle")
             dashboard.set_gibson_loading(False)
+            self._analysis_busy(False)
 
     @work(exclusive=True, thread=False, group="llm")
     async def _run_gibson_synthesize_worker(self) -> None:
@@ -485,7 +598,7 @@ class CerealKillerApp(App[None]):
             snippets = [
                 RAGSnippet(
                     source=s.get("source", ""),
-                    machine="",
+                    machine=s.get("machine", ""),
                     title=s.get("title", ""),
                     url=s.get("url", ""),
                     content=s.get("content", ""),
@@ -506,16 +619,74 @@ class CerealKillerApp(App[None]):
             self._analysis_busy(False)
             dashboard.set_gibson_loading(False)
 
-    async def _consume_llm_response(self, answer: str, thought: str) -> None:
+    @work(exclusive=True, thread=False, group="media")
+    async def _run_remote_visual_worker(self, url: str) -> None:
         dashboard = self._dashboard()
+        dashboard.set_active_tool("Media")
         try:
-            await self._safe_stream_thought(thought)
-            self._track_code_block(answer)
-            self._warn_if_repetitive_response(answer)
-            self._append_chat("assistant", answer)
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.get(url, follow_redirects=True)
+                response.raise_for_status()
+
+            try:
+                from PIL import Image
+            except Exception:
+                Image = None  # type: ignore[assignment]
+
+            if Image is None:
+                dashboard.append_system("Pillow is unavailable; cannot decode remote image.", style="red")
+                return
+
+            try:
+                image = Image.open(BytesIO(response.content)).convert("RGB")
+            except Exception as exc:
+                dashboard.append_system(f"Could not decode remote image: {exc}", style="red")
+                return
+
+            remote_target = Path("data/temp/remote_visual_buffer.png")
+            remote_target.parent.mkdir(parents=True, exist_ok=True)
+            image.save(remote_target, format="PNG")
+            image.close()
+
+            self._uploaded_image_path = remote_target.resolve()
+            dashboard.set_visual_buffer_image(remote_target, source="Remote")
+            dashboard.append_system("Remote diagram loaded into Media Drawer.", style="bold cyan")
+            self.notify("Remote image loaded", title="Visual Buffer", severity="information")
+        except Exception as exc:
+            dashboard.append_system(f"Remote image load failed: {exc}", style="red")
+        finally:
+            dashboard.set_active_tool("Idle")
+
+    def _try_dashboard(self) -> MainDashboard | None:
+        """Return MainDashboard from active screen or stack, if present."""
+        active = self.screen
+        if isinstance(active, MainDashboard):
+            return active
+        for screen in reversed(getattr(self, "screen_stack", [])):
+            if isinstance(screen, MainDashboard):
+                return screen
+        return None
+
+    async def _consume_llm_response(self, answer: str, thought: str) -> None:
+        # Persist assistant text first so we don't lose it if UI updates fail.
+        self._track_code_block(answer)
+        self._warn_if_repetitive_response(answer)
+        self._append_chat("assistant", answer)
+
+        dashboard = self._try_dashboard()
+        if dashboard is None:
+            self.notify("Response ready, but dashboard is temporarily unavailable.", title="Zero Cool", severity="warning")
+            return
+
+        try:
+            await self._safe_stream_thought(thought, dashboard=dashboard)
+            dashboard.set_active_view("chat")
             dashboard.append_assistant(answer)
         except Exception as exc:
-            dashboard.append_system(f"UI post-processing error: {exc}", style="red")
+            try:
+                dashboard.append_system(f"UI post-processing error: {exc}", style="red")
+            except Exception:
+                self.notify(f"Response ready (UI error: {exc})", title="Zero Cool", severity="warning")
 
     def _analysis_busy(self, active: bool) -> None:
         if active:
@@ -523,46 +694,6 @@ class CerealKillerApp(App[None]):
         else:
             self._analysis_jobs = max(0, self._analysis_jobs - 1)
         self._dashboard().set_loading(self._analysis_jobs > 0)
-
-    def _refresh_system_footer(self) -> None:
-        """Update compact footer stats (RAM + GPU temp) for the Gibson frame."""
-        try:
-            total_kb = 0
-            available_kb = 0
-            with Path("/proc/meminfo").open("r", encoding="utf-8") as meminfo:
-                for line in meminfo:
-                    if line.startswith("MemTotal:"):
-                        total_kb = int(line.split()[1])
-                    elif line.startswith("MemAvailable:"):
-                        available_kb = int(line.split()[1])
-            ram_total_gb = total_kb / (1024 * 1024) if total_kb else 0.0
-            ram_used_gb = (total_kb - available_kb) / (1024 * 1024) if total_kb else 0.0
-
-            gpu_temp = "N/A"
-            try:
-                result = subprocess.run(
-                    [
-                        "nvidia-smi",
-                        "--query-gpu=temperature.gpu",
-                        "--format=csv,noheader,nounits",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=1,
-                )
-                if result.returncode == 0:
-                    first_line = (result.stdout or "").strip().splitlines()
-                    if first_line:
-                        gpu_temp = f"{first_line[0]}"
-            except Exception:
-                pass
-
-            self._dashboard().set_system_footer(
-                f"RAM {ram_used_gb:4.1f}/{ram_total_gb:4.1f}GB | 5090 {gpu_temp}C"
-            )
-        except Exception:
-            return
 
     async def _run_boot_sequence(self) -> None:
         dashboard = self._dashboard()
@@ -606,6 +737,10 @@ class CerealKillerApp(App[None]):
                 # Pulse terminal link to show data is flowing
                 await dashboard.pulse_terminal_link()
 
+                self._run_cve_jit_worker(event.command)
+                if event.feedback_line:
+                    self._run_cve_jit_worker(event.feedback_line)
+
                 self.history_context = event.context_commands
                 phase = detect_phase(self.history_context)
                 dashboard.set_phase(phase)
@@ -646,8 +781,7 @@ class CerealKillerApp(App[None]):
 
     def on_clipboard_image_detected(self, message: ClipboardImageDetected) -> None:
         snapshot = message.snapshot
-        description = f"{snapshot.image_path.name}"
-        self._dashboard().set_visual_buffer(description, snapshot.preview)
+        self._dashboard().set_visual_buffer_image(snapshot.image_path, source="Clipboard", preview=snapshot.preview)
         self._uploaded_image_path = snapshot.image_path
         self.notify(
             f"Clipboard image buffered as {snapshot.image_path.name}",
@@ -677,12 +811,36 @@ class CerealKillerApp(App[None]):
                 pass
 
         preview = ascii_preview_for_image(resolved)
-        self._dashboard().set_visual_buffer(f"{resolved.name} ({source})", preview)
+        self._dashboard().set_visual_buffer_image(resolved, source=source, preview=preview)
         self._dashboard().append_system(f"Image Uploaded: {resolved.name}", style="bold cyan")
 
     @staticmethod
     def _is_image_file(path: Path) -> bool:
         return path.is_file() and path.suffix.lower() in _IMAGE_SUFFIXES
+
+    @staticmethod
+    def _looks_like_image_url(url: str) -> bool:
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return False
+        if parsed.scheme not in {"http", "https"}:
+            return False
+        lowered_path = (parsed.path or "").lower()
+        return any(lowered_path.endswith(suffix) for suffix in _IMAGE_SUFFIXES)
+
+    @classmethod
+    def _extract_visual_candidate_url(cls, snippets: list[dict]) -> str | None:
+        for snippet in snippets:
+            url = str(snippet.get("url", "")).strip()
+            if url and cls._looks_like_image_url(url):
+                return url
+
+            content = str(snippet.get("content", ""))
+            match = IMAGE_URL_RE.search(content)
+            if match:
+                return match.group(0)
+        return None
 
     def _open_ingest_modal(self, ingest_type: str) -> None:
         if ingest_type == "image" and Path("/screenshots").exists():
@@ -725,6 +883,40 @@ class CerealKillerApp(App[None]):
         except Exception:
             return
 
+    def _refresh_github_api_status(self) -> None:
+        # Timer callbacks can fire while a modal screen is active.
+        # In that state MainDashboard is not the current screen, so skip safely.
+        try:
+            dashboard = self._dashboard()
+        except RuntimeError:
+            return
+
+        snapshot = get_rate_snapshot()
+        if snapshot is None:
+            dashboard.set_github_api_status("unknown")
+            return
+        reset_in = max(0, int((snapshot.reset_epoch - int(_time.time())) / 60))
+        dashboard.set_github_api_status(f"{snapshot.remaining}/{snapshot.limit} (Resets in {reset_in}m)")
+
+    @work(exclusive=False, thread=False, group="cve-jit")
+    async def _run_cve_jit_worker(self, text: str) -> None:
+        cve_ids = extract_cve_ids(text)
+        if not cve_ids:
+            return
+
+        dashboard = self._dashboard()
+
+        def _warn(message: str) -> None:
+            dashboard.append_system(message, style="bold red")
+
+        for cve_id in cve_ids:
+            try:
+                await fetch_cve(self.kb.settings, cve_id, warn=_warn)
+            except Exception:
+                continue
+
+        self._refresh_github_api_status()
+
     @on(Button.Pressed, "#easy_button")
     def show_walkthrough(self) -> None:
         self._record_easy_usage()
@@ -759,6 +951,7 @@ class CerealKillerApp(App[None]):
         cleaned_message = self._strip_rich_tags(result.message)
         dashboard.append_system(cleaned_message, style="cyan")
         self._append_chat("assistant", cleaned_message)
+        self._run_cve_jit_worker(cleaned_message)
 
         if result.system_prompt_addendum is not None:
             self.engine.set_system_prompt_addendum(result.system_prompt_addendum)
@@ -844,14 +1037,16 @@ class CerealKillerApp(App[None]):
                 severity="warning",
             )
 
-    async def _safe_stream_thought(self, thought: str) -> None:
+    async def _safe_stream_thought(self, thought: str, *, dashboard: MainDashboard | None = None) -> None:
         """Best-effort thought streaming with backward-compatible fallbacks."""
-        dashboard = self._dashboard()
-        stream_method = getattr(dashboard, "stream_thought", None)
+        active_dashboard = dashboard or self._try_dashboard()
+        if active_dashboard is None:
+            return
+        stream_method = getattr(active_dashboard, "stream_thought", None)
         if callable(stream_method):
             await stream_method(thought)
             return
-        thought_box_method = getattr(dashboard, "thought_box", None)
+        thought_box_method = getattr(active_dashboard, "thought_box", None)
         if callable(thought_box_method):
             thought_box = thought_box_method()
             if thought_box is not None and hasattr(thought_box, "stream_thought"):

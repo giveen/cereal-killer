@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import hashlib
-import json
 import re
+import struct
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -70,7 +70,8 @@ class LibraryChunk:
             "title": self.title,
             "url": self.url,
             "content": self.content,
-            "embedding": json.dumps(vector),
+            # RediSearch VECTOR(FLOAT32, DIM 64) requires a raw binary blob.
+            "embedding": struct.pack(f"<{len(vector)}f", *vector),
             "source": self.source,
             "type": self.source_type,
             "tags": ",".join(f"{k}:{v}" for k, v in sorted(tags.items())),
@@ -351,8 +352,11 @@ def parse_source(source: SourceConfig) -> list[LibraryChunk]:
     for path in files:
         text = path.read_text(encoding="utf-8", errors="ignore")
         if source.parse_mode == "gtfobins":
-            if path.suffix.lower() in {".yml", ".yaml"}:
-                chunks.extend(_parse_gtfobins_yaml_file(source, path, text))
+            # GTFOBins stores entries as extensionless YAML files under _gtfobins/.
+            # Try structured YAML parsing first, then fallback to markdown parsing.
+            parsed = _parse_gtfobins_yaml_file(source, path, text)
+            if parsed:
+                chunks.extend(parsed)
             else:
                 chunks.extend(_parse_gtfobins_yaml(source, path, text))
         else:
@@ -372,6 +376,14 @@ async def ingest_chunks_for_source(
     _ensure_index(settings, source.index)
     client = Redis.from_url(settings.redis_url, decode_responses=True)
     now_iso = datetime.now(UTC).isoformat()
+
+    # Rebuild this source from a clean slate so stale/invalid hashes from prior
+    # schema bugs (e.g. wrong vector blob format) cannot poison indexing.
+    existing_keys = list(client.scan_iter(match=f"{source.index}:*"))
+    if existing_keys:
+        # Delete in manageable chunks to avoid oversized command payloads.
+        for offset in range(0, len(existing_keys), 500):
+            client.delete(*existing_keys[offset : offset + 500])
 
     ingested = 0
     failed = 0

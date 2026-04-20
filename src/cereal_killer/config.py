@@ -36,6 +36,7 @@ class Settings:
     llm_api_key: str = os.getenv("LLM_API_KEY", "not-needed")
     llm_model: str = os.getenv("LLM_MODEL", "qwen3.6")
     llm_vision_model: str = os.getenv("LLM_VISION_MODEL", "")
+    github_token: str = os.getenv("GITHUB_TOKEN", "")
     reasoning_parser: str = os.getenv("REASONING_PARSER", "qwen3")
     max_model_len: int = int(os.getenv("MAX_MODEL_LEN", "262144"))
     # SearXNG last-resort web search.  Empty string disables the feature.

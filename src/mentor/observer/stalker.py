@@ -161,7 +161,31 @@ def command_hash(command: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8", errors="ignore")).hexdigest()
 
 
+# Patterns indicating the line is Python source code rather than a shell command.
+# These leak into history when users run heredoc scripts directly in the terminal.
+_PYTHON_CODE_PREFIXES = (
+    "from ", "import ", "print(", "def ", "class ", "async def ",
+    "await ", "return ", "for ", "try:", "except ", "if __name__",
+    "with open", "    ",  # indented lines
+)
+
+
+def _is_python_code_line(command: str) -> bool:
+    """Return True if the command looks like Python source rather than a shell command."""
+    stripped = command.strip()
+    # Multi-line heredoc content often starts with keywords or is indented
+    if any(stripped.startswith(p) for p in _PYTHON_CODE_PREFIXES):
+        return True
+    # Lines ending with 'PY' delimiter are heredoc terminators
+    if stripped in ("PY", "EOF", "PYTHON"):
+        return True
+    return False
+
+
 def is_technical_command(command: str) -> bool:
+    # Never treat Python source code lines as technical commands
+    if _is_python_code_line(command):
+        return False
     try:
         parts = shlex.split(command)
     except ValueError:
@@ -194,6 +218,9 @@ def detect_feedback_signal(text: str) -> str | None:
     # Ignore lines that are clearly AI/TUI prose, not raw terminal output.
     # A genuine terminal failure line is short and terse; prose is long.
     if len(text) > 300:
+        return None
+    # Ignore lines that look like Python source code (heredoc leakage).
+    if _is_python_code_line(text):
         return None
     lowered_text = text.lower()
     if any(indicator in lowered_text for indicator in _PROSE_INDICATORS):

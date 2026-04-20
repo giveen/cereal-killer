@@ -3,10 +3,21 @@ from __future__ import annotations
 import asyncio
 import re
 import webbrowser
+from pathlib import Path
 
 from textual.containers import Horizontal, Vertical
 from textual import on
 from textual.widgets import Button, Collapsible, Input, Markdown, Static
+
+try:
+    from PIL import Image
+except Exception:  # pragma: no cover - allow non-vision paths to import
+    Image = None  # type: ignore[assignment]
+
+try:
+    from textual_imageview.viewer import ImageViewer
+except Exception:  # pragma: no cover - keep UI functional when dependency is absent
+    ImageViewer = None  # type: ignore[assignment]
 
 
 CODE_BLOCK_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]+)?\n(.*?)```", re.DOTALL)
@@ -218,6 +229,83 @@ class ThoughtBox(Collapsible):
             await asyncio.sleep(0.01)
 
 
+class VisualBuffer(Static):
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(id="visual_buffer_widget", **kwargs)
+        self._active_image_path: Path | None = None
+        self._remote_candidate_url: str | None = None
+
+    def compose(self):
+        with Vertical(id="visual_buffer_shell"):
+            yield Static("No active frame.", id="visual_buffer_status")
+            yield Static("SCANLINE FILTER: STANDBY", id="visual_scanline")
+            with Vertical(id="visual_image_host"):
+                yield Static("Waiting for screenshot upload or clipboard capture...", id="visual_image_placeholder")
+            with Horizontal(id="visual_buffer_actions"):
+                yield Button("[VIEW IMAGE]", id="visual_view_remote", variant="default")
+                yield Button("Send to Zero Cool", id="visual_send_zero_cool", variant="primary")
+                yield Button("Clear Buffer", id="clear_visual_buffer", variant="warning")
+
+    def on_mount(self) -> None:
+        self.query_one("#visual_view_remote", Button).styles.display = "none"
+        self.query_one("#visual_send_zero_cool", Button).styles.display = "none"
+
+    def set_remote_candidate(self, url: str | None) -> None:
+        cleaned = (url or "").strip()
+        self._remote_candidate_url = cleaned or None
+        view_btn = self.query_one("#visual_view_remote", Button)
+        if self._remote_candidate_url:
+            view_btn.styles.display = "block"
+            view_btn.label = "[VIEW IMAGE]"
+            self.query_one("#visual_buffer_status", Static).update("Remote diagram detected. Press [VIEW IMAGE].")
+        else:
+            view_btn.styles.display = "none"
+
+    def consume_remote_candidate(self) -> str | None:
+        return self._remote_candidate_url
+
+    def active_image_path(self) -> Path | None:
+        return self._active_image_path
+
+    def set_image_from_path(self, image_path: Path, *, source: str, preview: str = "") -> None:
+        resolved = image_path.expanduser().resolve()
+        if Image is None:
+            self.query_one("#visual_buffer_status", Static).update(f"Pillow unavailable: {resolved.name}")
+            self._active_image_path = resolved
+            self.query_one("#visual_send_zero_cool", Button).styles.display = "block"
+            return
+
+        try:
+            with Image.open(resolved) as raw:
+                image = raw.convert("RGB").copy()
+        except Exception as exc:
+            self.query_one("#visual_buffer_status", Static).update(f"Failed to load image: {exc}")
+            return
+
+        host = self.query_one("#visual_image_host", Vertical)
+        host.remove_children()
+
+        if ImageViewer is not None:
+            host.mount(ImageViewer(image))
+        else:
+            host.mount(Static("textual-imageview unavailable", id="visual_image_placeholder"))
+
+        status = f"ACTIVE FRAME: {resolved.name} ({source})"
+        if preview.strip():
+            status = f"{status}\n{preview}"
+        self.query_one("#visual_buffer_status", Static).update(status)
+        self.query_one("#visual_send_zero_cool", Button).styles.display = "block"
+        self._active_image_path = resolved
+
+    def clear(self) -> None:
+        self._active_image_path = None
+        host = self.query_one("#visual_image_host", Vertical)
+        host.remove_children()
+        host.mount(Static("Waiting for screenshot upload or clipboard capture...", id="visual_image_placeholder"))
+        self.query_one("#visual_buffer_status", Static).update("No active frame.")
+        self.query_one("#visual_send_zero_cool", Button).styles.display = "none"
+
+
 class SidebarStatus(Vertical):
     def __init__(self, **kwargs: object) -> None:
         super().__init__(id="intel_sidebar", **kwargs)
@@ -225,39 +313,56 @@ class SidebarStatus(Vertical):
 
     def compose(self):
         from .widgets_findings import FindingsWidget
-        
-        yield Static("[green]●[/green] TERMINAL LINK: ONLINE", id="terminal_link_status")
-        yield Static("CURRENT PHASE\n[IDLE]", id="current_phase")
-        yield Static("ACTIVE TOOL\nIdle", id="active_tool")
-        yield Static("KNOWLEDGE SYNC", id="knowledge_sync_label")
-        yield Static(
-            "ippsec: never\n"
-            "gtfobins: never\n"
-            "lolbas: never\n"
-            "hacktricks: never\n"
-            "payloads: never",
-            id="knowledge_sync_status",
-        )
-        yield Static("VISUAL BUFFER", id="visual_buffer_label")
-        yield Static("clipboard_obs.png\n(waiting for screenshot)", id="visual_buffer")
-        yield Button("Clear Buffer", id="clear_visual_buffer", variant="warning")
-        yield Static("UPLOAD PIPELINE", id="upload_progress_label")
-        yield VerticalProgressBar(max_value=100, value=0, height=4, id="upload_progress_bar")
-        yield Static("0%", id="upload_progress_value")
-        yield Static("PATHETIC METER", id="pathetic_meter")
-        yield VerticalProgressBar(max_value=10, value=0, height=10, id="pathetic_meter_bar")
-        yield Static("0/10", id="pathetic_meter_value")
-        yield FindingsWidget(id="findings_widget")
-        yield PulsingEasyButton()
+
+        with Horizontal(id="ops_status_bar"):
+            yield Static("LINK: [green]ONLINE[/green]", id="terminal_link_status", classes="ops-stat")
+            yield Static("|", classes="ops-sep")
+            yield Static("PHASE: [IDLE]", id="current_phase", classes="ops-stat")
+            yield Static("|", classes="ops-sep")
+            yield Static("TOOL: Idle", id="active_tool", classes="ops-stat")
+        with Horizontal(id="ops_bottom_row"):
+            yield Static("", id="ops_spacer")
+            with Vertical(id="ops_media_column"):
+                with Collapsible(title="Media Drawer", collapsed=False, id="visual_buffer_collapsible"):
+                    yield VisualBuffer()
+                yield Static(
+                    "[dim]KNOWLEDGE SYNC[/dim]\n"
+                    "ippsec: [bold]never[/bold]\n"
+                    "gtfobins: [bold]never[/bold]\n"
+                    "lolbas: [bold]never[/bold]\n"
+                    "hacktricks: [bold]never[/bold]\n"
+                    "payloads: [bold]never[/bold]",
+                    id="knowledge_sync_status",
+                )
+                yield Static(
+                    "[dim]SYSTEM HEALTH[/dim]\n"
+                    "GITHUB API: unknown",
+                    id="system_health_status",
+                )
+
+        # Retain compatibility targets for existing app update methods,
+        # but keep them hidden in the simplified Ops layout.
+        with Vertical(id="ops_hidden_compat"):
+            yield Static("UPLOAD PIPELINE", id="upload_progress_label")
+            yield VerticalProgressBar(max_value=100, value=0, height=4, id="upload_progress_bar")
+            yield Static("0%", id="upload_progress_value")
+            yield Static("PATHETIC METER", id="pathetic_meter")
+            yield VerticalProgressBar(max_value=10, value=0, height=10, id="pathetic_meter_bar")
+            yield Static("0/10", id="pathetic_meter_value")
+            yield FindingsWidget(id="findings_widget")
+            yield PulsingEasyButton()
+
+    def on_mount(self) -> None:
+        self.query_one("#visual_buffer_collapsible", Collapsible).styles.display = "none"
 
     def set_terminal_link_status(self, online: bool) -> None:
         """Update terminal link status. If online=True, show green ONLINE. If False, show red OFFLINE."""
         self._terminal_link_online = online
         status_widget = self.query_one("#terminal_link_status", Static)
         if online:
-            status_widget.update("[green]●[/green] TERMINAL LINK: ONLINE")
+            status_widget.update("LINK: [green]ONLINE[/green]")
         else:
-            status_widget.update("[red]●[/red] TERMINAL LINK: OFFLINE")
+            status_widget.update("LINK: [red]OFFLINE[/red]")
 
     async def pulse_terminal_link(self) -> None:
         """Briefly pulse the terminal link indicator to show data is flowing."""
@@ -265,17 +370,51 @@ class SidebarStatus(Vertical):
 
         # Pulse effect: flash to white and back
         for _ in range(2):
-            status_widget.update("[yellow]●[/yellow] TERMINAL LINK: DATA")
+            status_widget.update("LINK: [yellow]DATA[/yellow]")
             await asyncio.sleep(0.1)
-            status_widget.update("[green]●[/green] TERMINAL LINK: ONLINE" if self._terminal_link_online else "[red]●[/red] TERMINAL LINK: OFFLINE")
+            status_widget.update("LINK: [green]ONLINE[/green]" if self._terminal_link_online else "LINK: [red]OFFLINE[/red]")
             await asyncio.sleep(0.1)
 
     def set_knowledge_sync_status(self, statuses: dict[str, str]) -> None:
-        lines = []
+        lines = ["[dim]KNOWLEDGE SYNC[/dim]"]
         for name in ("ippsec", "gtfobins", "lolbas", "hacktricks", "payloads"):
             value = statuses.get(name, "never")
-            lines.append(f"{name}: {value}")
+            lines.append(f"{name}: [bold]{value}[/bold]")
         self.query_one("#knowledge_sync_status", Static).update("\n".join(lines))
+
+    def set_github_api_status(self, summary: str) -> None:
+        line = (summary or "unknown").strip()
+        self.query_one("#system_health_status", Static).update(
+            "[dim]SYSTEM HEALTH[/dim]\n"
+            f"GITHUB API: {line}"
+        )
+
+    def set_visual_buffer_image(self, image_path: Path, *, source: str, preview: str = "") -> None:
+        self.query_one("#visual_buffer_collapsible", Collapsible).styles.display = "block"
+        buffer_widget = self.query_one("#visual_buffer_widget", VisualBuffer)
+        buffer_widget.set_image_from_path(image_path, source=source, preview=preview)
+
+    def set_remote_image_candidate(self, url: str | None) -> None:
+        collapsible = self.query_one("#visual_buffer_collapsible", Collapsible)
+        buffer_widget = self.query_one("#visual_buffer_widget", VisualBuffer)
+        buffer_widget.set_remote_candidate(url)
+        if url:
+            collapsible.styles.display = "block"
+        elif buffer_widget.active_image_path() is None:
+            collapsible.styles.display = "none"
+
+    def get_remote_image_candidate(self) -> str | None:
+        return self.query_one("#visual_buffer_widget", VisualBuffer).consume_remote_candidate()
+
+    def get_visual_buffer_image_path(self) -> Path | None:
+        return self.query_one("#visual_buffer_widget", VisualBuffer).active_image_path()
+
+    def clear_visual_buffer(self) -> None:
+        collapsible = self.query_one("#visual_buffer_collapsible", Collapsible)
+        buffer_widget = self.query_one("#visual_buffer_widget", VisualBuffer)
+        buffer_widget.clear()
+        if not buffer_widget.consume_remote_candidate():
+            collapsible.styles.display = "none"
 
     def set_upload_progress(self, value: int, label: str = "UPLOAD") -> None:
         progress = max(0, min(100, value))
