@@ -20,6 +20,7 @@ from mentor.engine.minifier import minify_terminal_output
 from mentor.engine.pedagogy import PedagogyEngine
 from mentor.engine.search_orchestrator import tiered_search
 from mentor.engine.session import ThinkingSessionStore
+from mentor.kb.query import RAGSnippet
 from mentor.kb.query import format_reference_material, retrieve_reference_material
 
 
@@ -37,47 +38,42 @@ OLDER_ZERO_COOL_PROMPT = (
     "If commands are needed, return them in fenced code blocks."
 )
 
-# Injected into system prompt when live web results are used.
-_WEB_SEARCH_ADDENDUM = (
-    "You had to consult the live web for this response because local notes were insufficient. "
-    "Begin your reply with a brief sarcastic acknowledgement of that fact — "
-    "e.g., 'The local notes are dry. Hold on, let me see what the rest of the world thinks about this...' "
-    "Always cite the source URLs from the Live Web Results block when you use that information. "
-    "Do NOT invent URLs or fabricate citations."
+# Base persona. Snark level adjusts tone separately.
+OLDER_ZERO_COOL_PROMPT = (
+    "You are Older Zero Cool: sarcastic, experienced, practical. "
+    "You coach users using guided questions and progressive hints, not direct spoilers. "
+    "Keep answers concise, tactical, and safe. "
+    "Use retrieved reference material explicitly when relevant, e.g., call out IppSec box parallels and methodology pivots. "
+    "When a CURRENT TARGET is set, keep guidance grounded to that target and avoid drifting to unrelated machines. "
+    "If you mention another box, explain exactly why it is relevant and keep the focus on the current target. "
+    "When producing internal reasoning, put it inside <thought>...</thought>. "
+    "If commands are needed, return them in fenced code blocks."
 )
 
+# Snark tone calibration (1-10).
+_SNARK_ADDENDA: dict[int, str] = {
+    1: "TONE: Professional and polite. Answer directly without sarcasm.",
+    2: "TONE: Helpful and friendly, with occasional dry humor.",
+    3: "TONE: Matter-of-fact with light sarcasm.",
+    4: "TONE: Slightly sarcastic but still helpful.",
+    5: "TONE: Balanced: mix of sarcasm and genuine guidance.",
+    6: "TONE: Sarcastic but still constructive.",
+    7: "TONE: Heavy sarcasm; mock the user's mistakes but stay useful.",
+    8: "TONE: Very sarcastic and mocking; borderline insulting but technically brilliant. (Default)",
+    9: "TONE: Harsh and cutting sarcasm; roast the user's poor decisions.",
+    10: "TONE: Abusive and brutal; tear into every mistake. Technically correct but caustic.",
+}
 
-@dataclass(slots=True)
+
+@dataclass
 class BrainResponse:
     thought: str
     answer: str
     raw_content: str
-    reasoning_content: str
+    reasoning_content: str = ""
 
 
 class Brain:
-    COMMAND_CONTEXT_LIMIT = 20
-    STUCK_TURN_LIMIT = 5
-
-    def __init__(self, settings: Settings) -> None:
-        self.settings = settings
-        self.system_prompt = OLDER_ZERO_COOL_PROMPT
-        # Optional block injected by /box or /new-box; prepended to system prompt.
-        self.system_prompt_addendum: str = ""
-        # Callback invoked with True when a web search fires, False when it completes.
-        # Set by the UI to drive the live-web indicator.
-        self.on_web_search_state_change: "Callable[[bool], None] | None" = None
-        # Socratic state machine — tracks how long the user has been stuck.
-        self._pedagogy = PedagogyEngine()
-        self._session = ThinkingSessionStore(settings)
-        self._stalled_turns = 0
-        self._last_progress_signature = ""
-        self._recent_user_inputs: list[str] = []
-        self._last_user_input = ""
-        self._client: Any | None = None
-        if AsyncOpenAI is not None:
-            self._client = AsyncOpenAI(base_url=settings.llm_base_url, api_key=settings.llm_api_key)
-
     async def persist_mental_state(self, history_commands: list[str] | None = None) -> None:
         machine_name = Path.cwd().name
         thinking_chain = await self._session.thinking_buffer(machine_name)
@@ -160,6 +156,7 @@ class Brain:
         addendum_block = f"{self.system_prompt_addendum}\n\n" if self.system_prompt_addendum else ""
         web_addendum = f"{_WEB_SEARCH_ADDENDUM}\n\n" if search_result.used_web else ""
         pedagogy_block = f"{self._pedagogy.system_prompt_addendum()}\n\n"
+        snark_block = f"{self.snark_level_addendum()}\n\n"
         similarity_note = ""
         if self._is_similar_input(latest_input, self._last_user_input):
             similarity_note = (
@@ -175,6 +172,7 @@ class Brain:
         system_prompt = (
             f"{self.system_prompt}\n\n"
             f"{self._abrasive_prompt_addendum(pathetic_meter)}\n\n"
+            f"{snark_block}"
             f"{pedagogy_block}"
             f"{addendum_block}"
             f"{web_addendum}"
@@ -484,6 +482,60 @@ class Brain:
         except Exception:
             return "[session context pruned]"
 
+    async def synthesize_search_results(self, query: str, snippets: list[RAGSnippet]) -> BrainResponse:
+        """Synthesize raw local RAG snippets into a concise technical reference.
+
+        This path intentionally bypasses the usual conversation-history flow.
+        """
+        machine_name = Path.cwd().name
+        by_source: dict[str, list[RAGSnippet]] = {}
+        for snippet in snippets:
+            by_source.setdefault(snippet.source or "unknown", []).append(snippet)
+
+        source_blocks: list[str] = []
+        for source_name in sorted(by_source.keys()):
+            source_blocks.append(f"### SOURCE: {source_name.upper()}")
+            for idx, item in enumerate(by_source[source_name], start=1):
+                source_blocks.append(f"[{idx}] title: {item.title or '-'}")
+                source_blocks.append(f"    machine: {item.machine or '-'}")
+                source_blocks.append(f"    url: {item.url or '-'}")
+                source_blocks.append(f"    score: {item.score:.4f}")
+                source_blocks.append("    content:")
+                for line in (item.content or "").splitlines()[:120]:
+                    source_blocks.append(f"      {line}")
+                source_blocks.append("")
+
+        raw_data = "\n".join(source_blocks).strip() or "No local data retrieved."
+        system_prompt = (
+            "You are a senior penetration tester. "
+            f"The user has requested a direct search for '{query}'. "
+            "Below is the raw data retrieved from our local HackTricks and IppSec RAG. "
+            "Summarize this into a concise, Markdown-formatted technical reference. "
+            "Include code blocks for commands and cite the source machine or article. "
+            "If results are disparate or potentially ambiguous, organize the output by Source "
+            "so the user can distinguish machine walkthrough notes from general methodology."
+        )
+
+        user_message = (
+            f"Direct search query: {query}\n\n"
+            "Raw local RAG data:\n"
+            f"{raw_data}"
+        )
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
+
+        content, reasoning_content = await self._chat_completion(machine_name=machine_name, messages=messages)
+        parsed = parse_brain_output(content)
+        return BrainResponse(
+            thought=parsed.thought,
+            answer=parsed.answer,
+            raw_content=content,
+            reasoning_content=reasoning_content,
+        )
+
     @staticmethod
     def _abrasive_prompt_addendum(pathetic_meter: int) -> str:
         if pathetic_meter >= 8:
@@ -567,6 +619,27 @@ class Brain:
         if not match:
             return None
         return match.group(1).strip().lower()
+
+    def snark_level_addendum(self) -> str:
+        """Return tone calibration based on snark_level setting (1-10)."""
+        level = max(1, min(10, self.settings.snark_level))
+        return _SNARK_ADDENDA.get(level, _SNARK_ADDENDA[8])
+
+    @staticmethod
+    def suggest_tool_upgrade(command: str) -> str | None:
+        """Suggest a more advanced tool if user runs a baseline tool."""
+        tool_suggestions = {
+            'gobuster': 'Consider ffuf or feroxbuster for better speed and flexibility with patterns.',
+            'dirb': 'feroxbuster is much faster and more configurable than dirb.',
+            'nikto': 'Consider using a custom scan with nmap NSE scripts for more targeted results.',
+            'sqlmap': 'For complex exploitation, consider Burp Suite Pro or manual SQL injection analysis.',
+            'nc': 'netcat works, but try socat or ncat for more features and stability.',
+            'hydra': 'Consider more targeted approaches: medusa or custom scripts for specific services.',
+        }
+        for baseline, suggestion in tool_suggestions.items():
+            if baseline in command.lower():
+                return f"💡 Tip: {suggestion}"
+        return None
 
     @staticmethod
     def _file_to_data_uri(image_path: str) -> str:

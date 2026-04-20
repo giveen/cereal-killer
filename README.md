@@ -10,7 +10,7 @@
 - [Configuration](#configuration)
 - [Model Recommendations by VRAM](#model-recommendations-by-vram)
 - [Usage](#usage)
-- [Data Sync](#data-sync)
+- [Knowledge Sync (Redis Sources)](#knowledge-sync-redis-sources)
 - [Docker Commands](#docker-commands)
 - [Project Structure](#project-structure)
 - [Development](#development)
@@ -46,12 +46,15 @@ Workflow order for first run:
 2. `make docker-up-init`
 3. `make` (or `make run`)
 
+`make docker-up-init` now performs a full knowledge resync (`sync-all`), including IppSec and the configured library sources.
+
 Manual alternative:
 
 1. `make docker-up`
-2. `make sync-ippsec`
+2. `make sync-all`
+3. `make`
 
-Note: the sync target is named `make sync-ippsec`.
+If you only want the IppSec dataset (without full library refresh), use `make sync-ippsec`.
 
 Or run directly with Docker Compose:
 
@@ -102,7 +105,8 @@ python -m cereal_killer.main
 - Methodology audit warning when exploitation starts before recon.
 - `/box` and `/new-box` context switching commands.
 - `/victory` learnings vault command (also aliased as `/pwned`).
-- IppSec dataset sync into Redis vector index.
+- `/search` local synthesis over Redis-backed sources.
+- `/sync-hacktricks` and `/sync-all` knowledge ingestion workflows.
 
 ## Configuration
 
@@ -113,10 +117,18 @@ Use environment variables (from `.env` in Docker or your shell locally):
 - `LLM_BASE_URL` (default `http://host.docker.internal:8000/v1`)
 - `LLM_MODEL` (default `qwen3.6`)
 - `LLM_API_KEY` (default `not-needed`)
+- `LLM_VISION_BASE_URL` (default `http://localhost:8000/v1`)
+- `LLM_VISION_MODEL` (default empty, falls back to normal model path)
 - `REASONING_PARSER` (default `qwen3`)
 - `MAX_MODEL_LEN` (default `262144`)
 - `SEARXNG_BASE_URL` (default `http://localhost:18080`)
 - `SEARXNG_VECTOR_THRESHOLD` (default `0.7`)
+- `SNARK_LEVEL` (default `8`)
+- `LOOT_REPORT_DIR` (default `data/loot_reports`)
+
+Docker compose also sets:
+
+- `HISTORY_PATH` (default `/home/jabbatheduck/.zsh_history`)
 
 Template file: `.env.example`
 
@@ -167,6 +179,11 @@ Useful slash commands:
 /victory <what-you-learned>
 /clear [machine-name]
 /exit
+/vision              (analyze clipboard screenshot)
+/upload <path>       (analyze screenshot from file path)
+/search <query>      (search local Redis sources and synthesize)
+/sync-hacktricks     (ingest HackTricks into Redis)
+/sync-all            (refresh IppSec + configured sources from sources.yaml)
 ```
 
 Keyboard shortcuts:
@@ -174,6 +191,28 @@ Keyboard shortcuts:
 - `Ctrl+C`: quit
 - `Ctrl+T`: toggle thinking panel
 - `Ctrl+B`: Easy button pulse
+- `U`: toggle screenshot upload panel
+
+### Screenshot Upload Workflow
+
+**Local Development:**
+1. Copy screenshots to the `./screenshots/` directory in the cereal-killer repo
+2. Press `U` to open the upload panel on the left
+3. Click on an image file to analyze it with Zero Cool's vision capability
+
+**Docker on Kali/Remote Host:**
+1. Set the screenshots directory when starting Docker:
+   ```bash
+   SCREENSHOTS_DIR=/home/kali/Pictures make docker-up
+   make
+   ```
+2. Copy screenshots to `/home/kali/Pictures` (or your chosen directory)
+3. Press `U` to open the upload panel
+4. Click on images from your Kali screenshots to analyze them
+
+**Clipboard Integration:**
+- Use `/vision` command or copy an image to your clipboard
+- Zero Cool will analyze the clipboard image automatically when detected
 
 ## Example Workflow
 
@@ -184,7 +223,14 @@ Keyboard shortcuts:
 4) /victory <summary of vuln + exploit path>
 ```
 
-## Data Sync
+## Knowledge Sync (Redis Sources)
+
+The app supports two sync paths:
+
+- IppSec walkthrough dataset sync
+- Multi-source library sync (HackTricks, GTFOBins, LOLBAS, PayloadsAllTheThings)
+
+### 1) IppSec dataset sync
 
 No local virtual environment is required if you use Docker:
 
@@ -212,11 +258,63 @@ If you run the sync command from the host while Redis is started via Docker, use
 REDIS_URL=redis://localhost:6379 python scripts/sync_ippsec.py
 ```
 
+### 2) HackTricks-only sync
+
+From inside the TUI:
+
+```text
+/sync-hacktricks
+```
+
+Optional custom local clone path:
+
+```text
+/sync-hacktricks /path/to/hacktricks
+```
+
+From Docker (outside the TUI):
+
+```bash
+docker compose run --rm --build app python -m mentor.kb.sync_command
+```
+
+### 3) Full multi-source sync
+
+This refreshes IppSec first, then all configured repositories in `src/cereal_killer/kb/sources.yaml`.
+
+From inside the TUI:
+
+```text
+/sync-all
+```
+
+From Docker (outside the TUI):
+
+```bash
+docker compose run --rm --build app python -m mentor.kb.sync_command sync-all
+```
+
+From a local Python environment:
+
+```bash
+PYTHONPATH=src python3 -m mentor.kb.sync_command sync-all
+```
+
+Configured source registry (default):
+
+- HackTricks
+- GTFOBins
+- LOLBAS
+- PayloadsAllTheThings
+- IppSec (refreshed first by `sync-all`)
+
 ## Docker Commands
 
 - `make docker-build`: build service images
 - `make docker-up`: build and start Redis + SearXNG in the background
-- `make docker-up-init`: run `make docker-up`, then auto-run sync only if `ippsec_idx` is missing
+- `make docker-up-init`: run `make docker-up`, then run a full `sync-all` resync
+- `make sync-all`: run full knowledge sync (`sync_all_command`) inside the app container
+- `make sync-ippsec`: run IppSec-only sync inside the app container
 - `make` / `make run` / `make tui`: launch the Textual app (uses local install if available, otherwise falls back to `docker compose run --rm --build app cereal-killer`)
 - `make docker-down`: stop and remove the stack
 
@@ -265,6 +363,7 @@ Core Python dependencies (from `pyproject.toml`):
 - `pyperclip`
 - `pyautogui`
 - `mss`
+- `pyyaml`
 
 Docker services:
 
@@ -301,7 +400,9 @@ PYTHONPATH=src python3 -m unittest discover -s tests -q
 - If your model runs on another computer, make sure that host allows inbound traffic on the model port (for example `8000`) and that Docker can route to it.
 - If knowledge lookup is empty, ensure Redis is reachable and run dataset sync.
 - If Docker app cannot call host model, check `host.docker.internal` routing and the compose `extra_hosts` setting.
+- If history observation fails in Docker, verify `HISTORY_PATH` and host file permissions/UID-GID mapping.
 - SearXNG config is mounted as a read-only file (`config/searxng/settings.yml`) to avoid container ownership/permission drift in the repo. This prevents common `git pull` and `git reset` failures caused by root or container UID rewrites on tracked files.
+- If `sync-all` fails, verify outbound GitHub access and that Redis is reachable from the app container (`REDIS_URL`).
 
 ## Contributing
 

@@ -1,0 +1,32 @@
+sources:
+  - name: hacktricks
+    index: hacktricks
+    type: methodology
+    clone_url: https://github.com/HackTricks-wiki/hacktricks.git
+    local_path: ~/.cache/gibson-library/hacktricks
+    parse_mode: markdown
+    content_glob: src/**/*.md
+
+  - name: payloads
+    index: payloads
+    type: payloads
+    clone_url: https://github.com/swisskyrepo/PayloadsAllTheThings.git
+    local_path: ~/.cache/gibson-library/payloadsallthethings
+    parse_mode: markdown
+    content_glob: '**/*.md'
+
+  - name: gtfobins
+    index: gtfobins
+    type: privesc
+    clone_url: https://github.com/GTFOBins/GTFOBins.github.io.git
+    local_path: ~/.cache/gibson-library/gtfobins
+    parse_mode: gtfobins
+    content_glob: '_gtfobins/*.{md,yml,yaml}'
+
+  - name: lolbas
+    index: lolbas
+    type: privesc
+    clone_url: https://github.com/LOLBAS-Project/LOLBAS.git
+    local_path: ~/.cache/gibson-library/lolbas
+    parse_mode: markdown
+    content_glob: 'yml/**/*.yml'

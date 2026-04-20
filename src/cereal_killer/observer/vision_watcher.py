@@ -77,13 +77,28 @@ class ClipboardImageWatcher:
         if isinstance(payload, list) and payload:
             for entry in payload:
                 path = Path(str(entry))
-                if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"} and path.exists():
+                if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"} and path.exists():
                     try:
                         if Image is None:
                             return None
                         return Image.open(path)
                     except Exception:
                         continue
+        
+        # Fallback: Try xclip on Linux if running under X11/Wayland.
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
+                capture_output=True,
+                timeout=2,
+            )
+            if result.returncode == 0 and result.stdout:
+                from io import BytesIO
+                return Image.open(BytesIO(result.stdout))
+        except Exception:
+            pass
+        
         return None
 
     @staticmethod

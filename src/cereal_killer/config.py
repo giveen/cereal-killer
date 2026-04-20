@@ -20,6 +20,10 @@ class Settings:
     searxng_base_url: str = os.getenv("SEARXNG_BASE_URL", "http://localhost:18080")
     # Minimum Redis vector similarity (0-1) before falling back to web search.
     searxng_vector_threshold: float = float(os.getenv("SEARXNG_VECTOR_THRESHOLD", "0.7"))
+    # Snark calibration: 1 (polite) to 10 (abusive but brilliant). Default 8.
+    snark_level: int = int(os.getenv("SNARK_LEVEL", "8"))
+    # Loot report storage location.
+    loot_report_dir: str = os.getenv("LOOT_REPORT_DIR", "data/loot_reports")
 
 
 HISTORY_CONTEXT_LIMIT = 50

@@ -332,6 +332,8 @@ def retrieve_reference_material(
     context_commands: list[str] | None = None,
     top_k: int = 3,
     target_machine: str | None = None,
+    index_order: list[str] | None = None,
+    source_filters: list[str] | None = None,
 ) -> list[RAGSnippet]:
     context_commands = context_commands or []
     has_explicit_target = bool(target_machine and target_machine.strip())
@@ -350,11 +352,18 @@ def retrieve_reference_material(
     phase_bucket = _phase_bucket(context_commands)
     recent_fingerprints = _load_recent_snippet_fingerprints(settings, machine_name)
 
+    ordered_indexes = index_order[:] if index_order else ["ippsec", "gtfobins", "lolbas", "hacktricks", "payloads", settings.redis_index]
+    if source_filters:
+        allowed = {item.strip().lower() for item in source_filters if item.strip()}
+        ordered_indexes = [name for name in ordered_indexes if name.lower() in allowed]
+        if not ordered_indexes:
+            return []
+
     # First pass: if we know the active target, prefer exact machine docs.
     if target:
         target_hits: list[RAGSnippet] = []
         target_limit = max(top_k * 3, top_k)
-        for index_name in ("ippsec", "hacktricks", settings.redis_index):
+        for index_name in ordered_indexes:
             target_hits.extend(_query_target_machine_docs(settings, index_name, target, target_limit))
         if target_hits:
             # Preserve deterministic order while avoiding duplicate snippets.
@@ -375,7 +384,7 @@ def retrieve_reference_material(
                 return selected
 
     query_limit = max(_RERANK_CANDIDATES, top_k)
-    for index_name in ("ippsec", "hacktricks", settings.redis_index):
+    for index_name in ordered_indexes:
         try:
             combined.extend(
                 _query_single_index(

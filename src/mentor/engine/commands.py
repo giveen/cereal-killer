@@ -46,6 +46,8 @@ class CommandResult:
     reset_phase: bool = False
     # Optional image path used by /upload flow.
     upload_image_path: str | None = None
+    # Optional raw search query used by /search flow.
+    search_query: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +195,9 @@ async def _cmd_help(args: list[str], engine: object, settings: Settings) -> Comm
         "  [cyan]/upload <path>[/cyan]      — Analyze a specific image file",
         "  [cyan]/loot[/cyan]               — Generate a loot report for the current box",
         "  [cyan]/victory <text>[/cyan]     — Record post-pwn explanation in learnings vault",
+        "  [cyan]/search <query>[/cyan]     — Search local IppSec + HackTricks memory and synthesize results",
+        "  [cyan]/sync-hacktricks[/cyan]    — Ingest HackTricks library into Redis (one-time setup)",
+        "  [cyan]/sync-all[/cyan]           — Refresh all local knowledge sources from sources.yaml",
         "  [cyan]/clear[/cyan]              — Clear the current box session from Redis",
         "  [cyan]/exit[/cyan]               — Exit the TUI",
         "  [cyan]/help[/cyan]               — Show this message",
@@ -330,6 +335,93 @@ async def _cmd_exit(args: list[str], engine: object, settings: Settings) -> Comm
     )
 
 
+async def _cmd_sync_hacktricks(args: list[str], engine: object, settings: Settings) -> CommandResult:
+    """Sync and ingest HackTricks: Clone -> Parse -> Embed -> Store in Redis.
+    
+    This is a one-time or occasional operation that pulls the latest HackTricks
+    repository, extracts all Markdown files, chunks them semantically, embeds them,
+    and stores them in Redis for instant RAG retrieval.
+    
+    Usage:
+        /sync-hacktricks              — Use default cache directory (~/.cache/hacktricks)
+        /sync-hacktricks /path/to/ht  — Use custom HackTricks directory
+    """
+    import asyncio
+    from pathlib import Path as _Path
+    
+    # Determine HackTricks directory
+    if args:
+        hacktricks_dir = _Path(args[0]).expanduser().resolve()
+    else:
+        hacktricks_dir = _Path.home() / ".cache" / "hacktricks"
+    
+    try:
+        from mentor.kb.sync_command import sync_hacktricks_command
+        
+        # Run the sync in the background (non-blocking)
+        # This returns immediately but the sync continues
+        asyncio.create_task(
+            sync_hacktricks_command(
+                hacktricks_dir=hacktricks_dir,
+                settings=settings,
+                embed_fn=None,  # Uses default from settings
+            )
+        )
+        
+        return CommandResult(
+            message=(
+                f"[cyan]HackTricks sync started in background.[/cyan]\n"
+                f"[dim]Target: {hacktricks_dir}[/dim]\n"
+                "[yellow]This may take a few minutes. Check back in 2-5 min.[/yellow]\n"
+                "[green]Once complete, Zero Cool will have instant access to the entire HackTricks library.[/green]"
+            )
+        )
+    except Exception as exc:
+        return CommandResult(
+            message=(
+                f"[red]HackTricks sync failed:[/red] {exc}\n"
+                "[yellow]Make sure:[/yellow]\n"
+                "  • git is installed\n"
+                "  • Redis is running\n"
+                "  • Internet connection is available"
+            )
+        )
+
+
+async def _cmd_sync_all(args: list[str], engine: object, settings: Settings) -> CommandResult:
+    """Refresh all configured local knowledge sources."""
+    import asyncio
+
+    try:
+        from mentor.kb.sync_command import sync_all_command
+
+        asyncio.create_task(sync_all_command(settings=settings))
+        return CommandResult(
+            message=(
+                "[cyan]Global library sync started.[/cyan]\n"
+                "Refreshing IppSec / GTFOBins / LOLBAS / HackTricks / Payloads from sources.yaml.\n"
+                "[yellow]This may take several minutes depending on repo size and embedding throughput.[/yellow]"
+            ),
+            session_prefix="__sync_all__",
+        )
+    except Exception as exc:
+        return CommandResult(message=f"[red]sync-all failed:[/red] {exc}")
+
+
+async def _cmd_search(args: list[str], engine: object, settings: Settings) -> CommandResult:
+    """Run a direct local-memory search against IppSec + HackTricks and synthesize results."""
+    query = " ".join(args).strip()
+    if not query:
+        return CommandResult(
+            message="[yellow]Usage:[/yellow] /search <query>",
+        )
+    return CommandResult(
+        message=f"[cyan]Queued local search for:[/cyan] {query}",
+        session_prefix="__search__",
+        search_query=query,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Registry  —  verb → handler
 # ---------------------------------------------------------------------------
@@ -348,6 +440,9 @@ _REGISTRY: dict[str, _Handler] = {
     "pwned": _cmd_victory,       # alias
     "help": _cmd_help,
     "?": _cmd_help,
+    "search": _cmd_search,
+    "sync-all": _cmd_sync_all,
+    "sync-hacktricks": _cmd_sync_hacktricks,
 }
 
 

@@ -1,0 +1,3 @@
+# Place screenshots here for Zero Cool to analyze
+# When running cereal-killer locally: screenshots saved to this directory will appear in the 📸 Screenshots upload panel
+# When running in Docker: set SCREENSHOTS_DIR=/path/to/kali/screenshots before running `make docker-up`

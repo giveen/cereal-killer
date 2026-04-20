@@ -2,18 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import re
+import webbrowser
 from pathlib import Path
 from urllib.parse import quote, unquote
 
 from textual import on
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, Collapsible, DirectoryTree, LoadingIndicator, Markdown, RichLog, Static
+from textual.widgets import Button, Collapsible, DirectoryTree, LoadingIndicator, Markdown, Static
 
 from mentor.utils.clipboard import copy_text
 
-from .widgets import CommandInput, SidebarStatus, VerticalProgressBar
+from .widgets import ChatMessage, CommandInput, SidebarStatus, VerticalProgressBar
 
 
 CODE_BLOCK_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]+)?\n(.*?)```", re.DOTALL)
@@ -37,7 +38,7 @@ class SolutionModal(ModalScreen[None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="solution_shell"):
             yield Static("Decrypting walkthrough payload...", id="decryption_text")
-            yield Markdown("", id="solution_markdown")
+            yield Markdown("", id="solution_markdown", open_links=False)
             yield Button("Close", id="solution_close", variant="primary")
 
     async def on_mount(self) -> None:
@@ -60,6 +61,9 @@ class SolutionModal(ModalScreen[None]):
     @on(Markdown.LinkClicked, "#solution_markdown")
     def copy_markdown_code_block(self, event: Markdown.LinkClicked) -> None:
         href = event.href.strip()
+        if href.startswith(("http://", "https://")):
+            webbrowser.open(href)
+            return
         if not href.startswith("copy://"):
             return
         encoded = href.replace("copy://", "", 1)
@@ -90,12 +94,13 @@ class MainDashboard(Screen[None]):
         with Vertical(id="dashboard"):
             with Horizontal(id="main_row"):
                 with Vertical(id="explorer_pane"):
-                    with Collapsible(title="Directory Upload", collapsed=False, id="upload_collapsible"):
-                        yield DirectoryTree(str(Path.cwd()), id="upload_tree")
+                    with Collapsible(title="📸 Screenshots", collapsed=False, id="upload_collapsible"):
+                        screenshots_dir = Path("/screenshots") if Path("/screenshots").exists() else Path.cwd()
+                        yield DirectoryTree(str(screenshots_dir), id="upload_tree")
                 with Vertical(id="left_pane"):
-                    yield RichLog(id="chat_log", markup=True, wrap=True, highlight=True)
+                    yield VerticalScroll(id="chat_log")
                     yield Static("LATEST RESPONSE", id="response_title")
-                    yield Markdown("_No response yet._", id="response_markdown")
+                    yield Markdown("_No response yet._", id="response_markdown", open_links=False)
                     with Horizontal(id="response_actions"):
                         yield Button("Copy Response", id="copy_response", variant="default")
                         yield Button("Copy Code", id="copy_code", variant="primary")
@@ -104,22 +109,27 @@ class MainDashboard(Screen[None]):
             with Horizontal(id="bottom_row"):
                 yield CommandInput()
 
-    def chat_log(self) -> RichLog:
-        return self.query_one("#chat_log", RichLog)
+    def chat_log(self) -> VerticalScroll:
+        return self.query_one("#chat_log", VerticalScroll)
 
     async def stream_thought(self, thought: str) -> None:
         """Thought panel removed; keep async call sites stable."""
         return
 
     def append_user(self, text: str) -> None:
-        self.chat_log().write(f"[cyan]You>[/cyan] {text}")
+        self._append_chat_message("user", text)
 
     def append_assistant(self, text: str) -> None:
-        self.chat_log().write(f"[magenta]Zero Cool>[/magenta] {text}")
+        self._append_chat_message("assistant", text)
         self._update_response_markdown(text)
 
     def append_system(self, text: str, *, style: str = "yellow") -> None:
-        self.chat_log().write(f"[{style}]System>[/{style}] {text}")
+        self._append_chat_message("system", text)
+
+    def _append_chat_message(self, role: str, text: str) -> None:
+        container = self.chat_log()
+        container.mount(ChatMessage(role=role, message=text))
+        container.scroll_end(animate=False)
 
     def set_phase(self, phase: str) -> None:
         phase_widget = self.query_one("#current_phase", Static)
@@ -159,22 +169,33 @@ class MainDashboard(Screen[None]):
         self.query_one("#pathetic_meter_bar", VerticalProgressBar).set_value(value)
         self.query_one("#pathetic_meter_value", Static).update(f"{value}/10")
 
+    def set_terminal_link_online(self, online: bool) -> None:
+        """Update terminal link status indicator."""
+        sidebar = self.query_one("#intel_sidebar", SidebarStatus)
+        sidebar.set_terminal_link_status(online)
+
+    def set_knowledge_sync_status(self, statuses: dict[str, str]) -> None:
+        sidebar = self.query_one("#intel_sidebar", SidebarStatus)
+        sidebar.set_knowledge_sync_status(statuses)
+
+    async def pulse_terminal_link(self) -> None:
+        """Pulse the terminal link indicator to show data is flowing."""
+        sidebar = self.query_one("#intel_sidebar", SidebarStatus)
+        await sidebar.pulse_terminal_link()
+
     def apply_responsive_layout(self, width: int) -> None:
-        sidebar = self.query_one("#intel_sidebar", Vertical)
-        explorer = self.query_one("#explorer_pane", Vertical)
-        if width < 120:
-            sidebar.add_class("hidden")
-            explorer.add_class("hidden")
-        else:
-            sidebar.remove_class("hidden")
-            explorer.remove_class("hidden")
+        """Responsive layout is now handled by media queries in CSS.
+        This method is kept for compatibility."""
+        pass
 
     def toggle_upload_tree(self) -> None:
+        """Toggle the explorer pane visibility (U shortcut)."""
         explorer = self.query_one("#explorer_pane", Vertical)
-        if explorer.has_class("hidden"):
-            explorer.remove_class("hidden")
+        # Use CSS display instead of class to avoid media query conflicts
+        if explorer.styles.display == "none":
+            explorer.styles.display = "block"
         else:
-            explorer.add_class("hidden")
+            explorer.styles.display = "none"
 
     def set_upload_root(self, root_path: Path) -> None:
         tree = self.query_one("#upload_tree", DirectoryTree)
@@ -246,6 +267,9 @@ class MainDashboard(Screen[None]):
     @on(Markdown.LinkClicked, "#response_markdown")
     def copy_response_code_block(self, event: Markdown.LinkClicked) -> None:
         href = event.href.strip()
+        if href.startswith(("http://", "https://")):
+            webbrowser.open(href)
+            return
         if not href.startswith("copy://"):
             return
         encoded = href.replace("copy://", "", 1)

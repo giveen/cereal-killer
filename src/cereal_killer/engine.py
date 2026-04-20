@@ -8,6 +8,7 @@ from typing import Callable
 from cereal_killer.config import Settings
 from mentor.engine.brain import Brain, parse_brain_output
 from mentor.engine.pedagogy import HintLevel, PedagogyEngine
+from mentor.kb.query import RAGSnippet
 # Approximate context budget for auto-pruning.
 # 262 144 tokens × 3 chars/token × 80 % ≈ 629 000 chars.  When the running
 # chat transcript exceeds this we summarise the oldest 20 % of entries.
@@ -168,6 +169,14 @@ class LLMEngine:
         )
     async def summarize_session(self, session_text: str) -> str:
         return await self._brain.summarize_session(session_text)
+
+    async def synthesize_search_results(self, query: str, snippets: list[RAGSnippet]) -> LLMResponse:
+        response = await self._brain.synthesize_search_results(query, snippets)
+        return LLMResponse(
+            thought=response.thought,
+            answer=response.answer,
+            reasoning_content=response.reasoning_content,
+        )
 
     def prune_threshold(self) -> int:
         """Character count at which the transcript should be pruned."""

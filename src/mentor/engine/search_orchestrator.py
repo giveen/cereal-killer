@@ -26,6 +26,7 @@ from mentor.tools.web_search import WebResult, format_web_results, search as web
 # redisvl returns vector_distance where 0 = identical, 1 = orthogonal.
 # We invert: score = 1 - distance; so a score < threshold → go to web.
 _DEFAULT_VECTOR_THRESHOLD = 0.7
+_DEFAULT_INDEX_PRIORITY = ["ippsec", "gtfobins", "lolbas", "hacktricks", "payloads"]
 
 
 @dataclass(slots=True)
@@ -68,6 +69,8 @@ async def tiered_search(
     force_web: bool = False,
     allow_web: bool = True,
     max_web_results: int = 5,
+    top_k: int = 3,
+    source_filters: list[str] | None = None,
 ) -> SearchResult:
     """Run the tiered search pipeline.
 
@@ -91,8 +94,10 @@ async def tiered_search(
         settings,
         command_or_prompt=query,
         context_commands=history_commands,
-        top_k=3,
+        top_k=top_k,
         target_machine=target_machine,
+        index_order=_DEFAULT_INDEX_PRIORITY,
+        source_filters=source_filters,
     )
     best_score = _best_vector_score(vector_snippets)
 
@@ -116,7 +121,7 @@ async def tiered_search(
     if web_results:
         no_local = not bool(vector_snippets)
         preamble = (
-            "I've checked IppSec and HackTricks. "
+            "I've checked local Gibson sources (IppSec, GTFOBins/LOLBAS, HackTricks, Payloads). "
             "We're in uncharted territory. I'm hitting the web for this one.\n"
             if no_local else
             "Zero Cool had to check the live web for this one.\n"

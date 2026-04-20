@@ -19,6 +19,7 @@ dependencies = [
   "python-multipart>=0.0.9",
   "pyautogui>=0.9.54",
   "mss>=9.0.1",
+  "pyyaml>=6.0.1",
 ]
 
 [project.scripts]

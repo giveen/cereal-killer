@@ -1,4 +1,4 @@
-.PHONY: docker-build docker-up docker-up-init docker-down tui run start sync-ippsec
+.PHONY: docker-build docker-up docker-up-init docker-down tui run start sync-ippsec sync-all
 
 .DEFAULT_GOAL := tui
 
@@ -15,13 +15,8 @@ docker-up:
 	docker compose up -d --build redis searxng
 
 docker-up-init: docker-up
-	@INDEX="$${REDIS_INDEX:-ippsec_idx}"; \
-	if docker compose exec -T redis redis-cli FT._LIST 2>/dev/null | tr -d '\r' | grep -Fxq "$$INDEX"; then \
-		echo "Redis index '$$INDEX' already exists; skipping sync."; \
-	else \
-		echo "Redis index '$$INDEX' not found; running sync-ippsec..."; \
-		$(MAKE) sync-ippsec; \
-	fi
+	@echo "Running full knowledge sync (IppSec + configured sources)..."
+	$(MAKE) sync-all
 
 tui:
 	@if command -v cereal-killer >/dev/null 2>&1; then \
@@ -50,3 +45,6 @@ docker-down:
 
 sync-ippsec:
 	docker compose run --rm --build app python scripts/sync_ippsec.py
+
+sync-all:
+	docker compose run --rm --build app python -m mentor.kb.sync_command sync-all

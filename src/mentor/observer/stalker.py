@@ -139,8 +139,12 @@ def parse_history_lines(raw: str) -> list[str]:
             continue
 
         # zsh extended history: ': 1712345678:0;command'
+        # Strip the timestamp before adding to commands
         if stripped.startswith(": ") and ";" in stripped:
-            commands.append(stripped.split(";", 1)[1].strip())
+            # Extract and clean the command after the semicolon
+            cmd = stripped.split(";", 1)[1].strip()
+            if cmd:
+                commands.append(cmd)
             continue
 
         # fish history snippet: '- cmd: command'
@@ -323,17 +327,45 @@ def filter_context_commands(commands: list[str], cwd: str, limit: int = HISTORY_
 _FEEDBACK_COOLDOWN_SECS = 30
 
 
+def _read_history_file_binary(path: Path) -> str:
+    """Read history file in binary mode to handle non-UTF-8 bytes and null characters.
+    
+    This prevents crashes when Kali or other systems write weird metadata to history files.
+    Returns decoded text with errors ignored.
+    """
+    try:
+        with path.open("rb") as f:
+            raw_bytes = f.read()
+        return raw_bytes.decode("utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+def _check_history_path_readable(path: Path) -> tuple[bool, str]:
+    """Check if history path is readable. Returns (is_readable, error_message)."""
+    if not path.exists():
+        return False, f"I'm blind! I can't read {path}. The history file doesn't exist. Check your HISTORY_PATH or file permissions."
+    
+    if not os.access(path, os.R_OK):
+        return False, f"I'm blind! I can't read {path}. Check your UID/GID or file permissions. Current user: {os.getuid()}:{os.getgid()}"
+    
+    return True, ""
+
+
 async def observe_history(cwd: str) -> AsyncIterator[HistoryEvent]:
     if awatch is None or Change is None:
         raise RuntimeError("watchfiles is required for asynchronous history stalking.")
 
-    history_files = candidate_history_files()
-    while not history_files:
-        await asyncio.sleep(5)
-        yield HistoryEvent(command="", context_commands=[], trigger_brain=False)
-        history_files = candidate_history_files()
-
-    target = history_files[0]
+    # Get history path from environment or use default
+    history_path_str = os.environ.get("HISTORY_PATH", "/home/jabbatheduck/.zsh_history")
+    history_path = Path(history_path_str).expanduser()
+    
+    # Check if history path is readable and raise visible error if not
+    is_readable, error_msg = _check_history_path_readable(history_path)
+    if not is_readable:
+        raise RuntimeError(error_msg)
+    
+    target = history_path
     feedback_files = candidate_feedback_files()
     watch_targets = [target, *feedback_files]
     feedback_offsets: dict[Path, int] = {}
@@ -349,10 +381,14 @@ async def observe_history(cwd: str) -> AsyncIterator[HistoryEvent]:
     _last_feedback_trigger: float = 0.0
     _triggered_line_hashes: set[str] = set()
 
+    # Track file size for delta-only reading
+    file_offset = 0
     try:
-        text = target.read_text(encoding="utf-8", errors="ignore")
+        text = _read_history_file_binary(target)
+        file_offset = target.stat().st_size
     except OSError:
         text = ""
+        file_offset = 0
 
     command_stream = parse_history_lines(text)
     seen_hashes = {command_hash(command) for command in command_stream}
@@ -418,7 +454,23 @@ async def observe_history(cwd: str) -> AsyncIterator[HistoryEvent]:
             continue
 
         try:
-            text = target.read_text(encoding="utf-8", errors="ignore")
+            # Read file in binary mode and track size for delta-only reads
+            current_size = target.stat().st_size
+            if current_size < file_offset:
+                # File was truncated/rotated - read entire file
+                text = _read_history_file_binary(target)
+            elif current_size > file_offset:
+                # Read only the delta
+                with target.open("rb") as f:
+                    f.seek(file_offset)
+                    delta_bytes = f.read()
+                delta_text = delta_bytes.decode("utf-8", errors="ignore")
+                text = text + delta_text
+            else:
+                # No change in size
+                continue
+            
+            file_offset = current_size
         except OSError:
             continue
 

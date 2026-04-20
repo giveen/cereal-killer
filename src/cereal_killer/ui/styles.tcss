@@ -1,20 +1,22 @@
 Screen {
     background: #090d10;
     color: #b8ffd8;
+    layout: vertical;
 }
 
 #dashboard {
     height: 1fr;
     padding: 1;
+    layout: vertical;
 }
 
 #main_row {
     height: 1fr;
+    layout: horizontal;
 }
 
 #explorer_pane {
     width: 1fr;
-    min-width: 30;
     height: 1fr;
     border: tall #4f7a5e;
     background: #0b1410;
@@ -33,28 +35,98 @@ Screen {
 }
 
 #left_pane {
-    width: 2fr;
-    min-width: 60;
+    width: 1fr;
     height: 1fr;
     border: tall #1ee37a;
     background: #0e1711;
     padding: 1;
     margin-right: 1;
+    layout: vertical;
 }
 
 #chat_log {
-    height: 2fr;
+    height: 1fr;
     border: tall #2ce38c;
     background: #07120c;
     color: #bcffd8;
+    padding: 1;
+    overflow-y: auto;
+}
+
+.chat-message {
+    height: auto;
+    border: round #224634;
+    background: #0b1912;
+    margin-bottom: 1;
     padding: 0 1;
 }
 
-#response_title {
-    margin-top: 1;
+.chat-assistant {
+    border: round #355c7d;
+    background: #0a1520;
+}
+
+.chat-system {
+    border: round #6f2f2f;
+    background: #1d1010;
+}
+
+.chat-role {
+    color: #8fd5ff;
+    text-style: bold;
+    height: auto;
     margin-bottom: 1;
+}
+
+.chat-markdown {
+    height: auto;
+    width: 1fr;
+    color: #d6ecff;
+    link-color: #79c7ff;
+    link-style: underline;
+    link-background: transparent;
+    link-color-hover: #c2e7ff;
+    link-style-hover: bold underline;
+    link-background-hover: #243247 30%;
+}
+
+.chat-markdown MarkdownFence {
+    background: #1a2233;
+    border: tall #3f557a;
+    color: #e7f0ff;
+}
+
+.code-actions {
+    height: auto;
+    margin-top: 1;
+}
+
+.code-action-row {
+    height: auto;
+    align: left middle;
+    margin-bottom: 1;
+}
+
+.code-action-label {
+    width: 1fr;
+    color: #a8c8ff;
+}
+
+.copy-code-button {
+    width: auto;
+    min-width: 12;
+    background: #2a3e61;
+    color: #e8f2ff;
+    border: round #5376ad;
+}
+
+#response_title {
+    height: auto;
     color: #9cffc8;
     text-style: bold;
+    border: tall #4fd2ff;
+    padding: 1;
+    background: #0a1620;
 }
 
 #response_markdown {
@@ -63,12 +135,25 @@ Screen {
     background: #0a1620;
     color: #d9f5ff;
     padding: 0 1;
+    display: none;
+    link-color: #79c7ff;
+    link-style: underline;
+    link-background: transparent;
+    link-color-hover: #c2e7ff;
+    link-style-hover: bold underline;
+    link-background-hover: #243247 30%;
+}
+
+#response_markdown MarkdownFence {
+    background: #1a2233;
+    border: tall #3f557a;
+    color: #e7f0ff;
 }
 
 #response_actions {
     height: auto;
-    margin-top: 1;
     align: left middle;
+    layout: horizontal;
 }
 
 #copy_response,
@@ -82,32 +167,21 @@ Screen {
 }
 
 #thought_box {
-    height: 14;
-    margin-top: 1;
-    border: round #4fd2ff;
-    background: #0a1620;
+    display: none;
 }
 
 #thought_markdown {
-    color: #a9e7ff;
-    background: #0a1620;
-    padding: 0 1;
+    display: none;
 }
 
 #intel_sidebar {
     width: 1fr;
-    min-width: 34;
     height: 1fr;
     border: double #ff3d3d;
-    background: #1a0b0b;
-    padding: 1;
-}
-
-#current_phase {
-    border: tall #4f5b66;
     padding: 1;
     text-style: bold;
     margin-bottom: 1;
+    height: auto;
 }
 
 #active_tool {
@@ -115,6 +189,24 @@ Screen {
     padding: 1;
     margin-bottom: 1;
     color: #ffb3aa;
+    height: auto;
+}
+
+#knowledge_sync_label {
+    border: tall #3d5a7a;
+    padding: 1;
+    margin-bottom: 0;
+    color: #b8d8ff;
+    height: auto;
+}
+
+#knowledge_sync_status {
+    border: tall #2b3f57;
+    padding: 1;
+    margin-bottom: 1;
+    background: #0b1320;
+    color: #d4e7ff;
+    height: auto;
 }
 
 #visual_buffer_label {
@@ -122,6 +214,7 @@ Screen {
     padding: 1;
     margin-bottom: 0;
     color: #b5d9ff;
+    height: auto;
 }
 
 #visual_buffer {
@@ -130,11 +223,12 @@ Screen {
     margin-bottom: 1;
     background: #08121d;
     color: #d6efff;
-    height: 14;
+    height: 1fr;
 }
 
 #clear_visual_buffer {
     margin-bottom: 1;
+    height: auto;
 }
 
 #pathetic_meter {
@@ -142,6 +236,7 @@ Screen {
     padding: 1;
     margin-bottom: 1;
     color: #ff9c8a;
+    height: auto;
 }
 
 #pathetic_meter_bar {
@@ -160,10 +255,12 @@ Screen {
 #bottom_row {
     height: auto;
     margin-top: 1;
+    layout: horizontal;
 }
 
 #command_input {
     width: 1fr;
+    height: auto;
     border: tall #2ce38c;
     background: #0a130f;
     color: #e9ffef;
@@ -171,7 +268,7 @@ Screen {
 
 #easy_button {
     dock: bottom;
-    min-height: 3;
+    height: auto;
     text-style: bold;
     border: tall #ff3030;
     color: #fff0f0;
@@ -213,4 +310,200 @@ Screen {
 
 .hidden {
     display: none;
+}
+
+/* ====== RESPONSIVE BREAKPOINTS ====== */
+
+/* VERY SMALL: < 100 chars — Chat only, no sidebars */
+@media (max-width: 100) {
+    #dashboard {
+        padding: 0;
+    }
+    
+    #main_row {
+        layout: vertical;
+    }
+    
+    #explorer_pane {
+        display: none;
+    }
+    
+    #left_pane {
+        margin-right: 0;
+        padding: 0;
+        border: none;
+    }
+    
+    #chat_log {
+        padding: 0;
+        border: none;
+    }
+    
+    #response_title {
+        display: none;
+    }
+    
+    #response_actions {
+        display: none;
+    }
+    
+    #intel_sidebar {
+        display: none;
+    }
+    
+    #easy_button {
+        display: none;
+    }
+}
+
+/* SMALL: 100-140 chars — Chat + sidebar stacked vertically */
+@media (min-width: 100) and (max-width: 140) {
+    #main_row {
+        layout: vertical;
+    }
+    
+    #explorer_pane {
+        display: none;
+    }
+    
+    #left_pane {
+        height: 2fr;
+        margin-right: 0;
+    }
+    
+    #intel_sidebar {
+        height: 1fr;
+        border: tall #ff3d3d;
+        margin-top: 1;
+        padding: 1;
+    }
+    
+    #response_title {
+        display: none;
+    }
+    
+    #response_markdown {
+        display: none;
+    }
+    
+    #response_actions {
+        display: none;
+    }
+    
+    #easy_button {
+        display: none;
+    }
+}
+
+/* MEDIUM: 140-180 chars — Chat + sidebar side-by-side, no explorer */
+@media (min-width: 140) and (max-width: 180) {
+    #main_row {
+        layout: horizontal;
+    }
+    
+    #explorer_pane {
+        display: none;
+    }
+    
+    #left_pane {
+        width: 2fr;
+        height: 1fr;
+    }
+    
+    #intel_sidebar {
+        width: 1fr;
+        height: 1fr;
+    }
+    
+    #response_title {
+        display: none;
+    }
+    
+    #response_markdown {
+        display: none;
+    }
+    
+    #response_actions {
+        display: none;
+    }
+    
+    #easy_button {
+        display: none;
+    }
+}
+
+/* LARGE: 180-220 chars — Full layout with explorer, chat, sidebar */
+@media (min-width: 180) and (max-width: 220) {
+    #main_row {
+        layout: horizontal;
+    }
+    
+    #explorer_pane {
+        width: 25;
+        display: block;
+    }
+    
+    #left_pane {
+        width: 2fr;
+        height: 1fr;
+    }
+    
+    #intel_sidebar {
+        width: 1fr;
+        height: 1fr;
+    }
+    
+    #response_title {
+        display: none;
+    }
+    
+    #response_markdown {
+        display: none;
+    }
+    
+    #response_actions {
+        display: none;
+    }
+    
+    #easy_button {
+        display: none;
+    }
+}
+
+/* EXTRA LARGE: 220+ chars — Full 3-pane with response panel and buttons */
+@media (min-width: 220) {
+    #main_row {
+        layout: horizontal;
+    }
+    
+    #explorer_pane {
+        width: 25;
+        display: block;
+    }
+    
+    #left_pane {
+        width: 2fr;
+        height: 1fr;
+    }
+    
+    #chat_log {
+        height: 2fr;
+    }
+    
+    #response_markdown {
+        display: block;
+    }
+    
+    #response_actions {
+        display: block;
+    }
+    
+    #intel_sidebar {
+        width: 1fr;
+        height: 1fr;
+    }
+    
+    #easy_button {
+        display: block;
+    }
 }

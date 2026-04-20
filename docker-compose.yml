@@ -1,6 +1,10 @@
 services:
   app:
-    build: .
+    build:
+      context: .
+      args:
+        USER_ID: ${USER_ID:-1000}
+        GROUP_ID: ${GROUP_ID:-1000}
     depends_on:
       - redis
       - searxng
@@ -15,12 +19,14 @@ services:
       REASONING_PARSER: ${REASONING_PARSER:-qwen3}
       MAX_MODEL_LEN: ${MAX_MODEL_LEN:-262144}
       SEARXNG_BASE_URL: ${SEARXNG_BASE_URL:-http://searxng:8080}
+      HISTORY_PATH: ${HISTORY_PATH:-/home/jabbatheduck/.zsh_history}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ~/.zsh_history:/root/.zsh_history:ro
-      - ~/.bash_history:/root/.bash_history:ro
-      - ~/.local/share/fish/fish_history:/root/.local/share/fish/fish_history:ro
+      - ~/.zsh_history:/home/appuser/.zsh_history:ro
+      - ~/.bash_history:/home/appuser/.bash_history:ro
+      - ~/.local/share/fish/fish_history:/home/appuser/.local/share/fish/fish_history:ro
+      - ${SCREENSHOTS_DIR:-/tmp/screenshots}:/screenshots:ro
     tty: true
     stdin_open: true
 

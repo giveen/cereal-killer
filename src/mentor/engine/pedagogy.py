@@ -96,3 +96,47 @@ class PedagogyEngine:
     def should_allow_web_search(self) -> bool:
         """Web search (SearXNG last resort) is only unlocked at DIRECT level."""
         return self.current_hint_level() == HintLevel.DIRECT
+
+
+# ---------------------------------------------------------------------------
+# Rabbit-Hole Guardian
+# ---------------------------------------------------------------------------
+
+class RabbitHoleGuardian:
+    """Detects when user spends >N commands on a service NOT in the solution path.
+    
+    Purpose: Prevent tunnel vision on red herrings; nudge user back to the main track.
+    """
+    
+    RABBIT_HOLE_THRESHOLD = 20  # Command count before nudging
+    
+    def __init__(self) -> None:
+        self._service_command_count: dict[str, int] = {}
+        self._solution_services: set[str] = set()
+    
+    def set_solution_services(self, services: list[str]) -> None:
+        """Cache the list of services mentioned in the target walkthrough."""
+        self._solution_services = set(s.lower() for s in services)
+    
+    def record_command(self, command: str, service_identified: str | None = None) -> None:
+        """Track command usage per service."""
+        if service_identified:
+            service = service_identified.lower()
+            self._service_command_count[service] = self._service_command_count.get(service, 0) + 1
+    
+    def check_rabbit_hole(self, service: str | None = None) -> str | None:
+        """Return nudge message if user is off-track; else None."""
+        if not service or not self._solution_services:
+            return None
+        
+        service = service.lower()
+        count = self._service_command_count.get(service, 0)
+        
+        # Off-track and exceeding threshold?
+        if service not in self._solution_services and count >= self.RABBIT_HOLE_THRESHOLD:
+            return (
+                "You're getting tunnel vision. Step back and look at the bigger picture "
+                f"(or the other ports). {service} might not be the key here."
+            )
+        
+        return None

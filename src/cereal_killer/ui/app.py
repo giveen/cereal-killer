@@ -5,6 +5,7 @@ import difflib
 import json
 import re
 import shutil
+import subprocess
 import time as _time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,6 +27,8 @@ from cereal_killer.observer import (
 )
 from mentor.engine.commands import CommandResult, dispatch as dispatch_command
 from mentor.engine.methodology import audit_command as audit_methodology
+from mentor.engine.search_orchestrator import tiered_search
+from mentor.kb.library_ingest import fetch_sync_status
 from mentor.kb.query import retrieve_solution_for_machine
 from mentor.ui.phase import detect_phase
 from mentor.ui.startup import run_boot_sequence
@@ -36,6 +39,7 @@ from .widgets import PulsingEasyButton
 
 _AUTO_COACH_COOLDOWN_SECS = 10
 CODE_BLOCK_PATTERN = re.compile(r"```(?:[a-zA-Z0-9_+-]+)?\n(.*?)```", re.DOTALL)
+SEARCH_SOURCE_FILTER_RE = re.compile(r"\bonly\s+(ippsec|gtfobins|lolbas|hacktricks|payloads)\b", re.IGNORECASE)
 VISION_BUFFER_PATH = Path("data/temp/clipboard_obs.png")
 VISION_PROMPT = (
     "Zero Cool, I've just pasted a screenshot. "
@@ -88,9 +92,11 @@ class CerealKillerApp(App[None]):
         self.set_interval(0.7, self._pulse_easy_button)
         self.set_interval(300, self._schedule_persist_mental_state)
         self.set_interval(60, self._schedule_context_prune)
+        self.set_interval(60, self._refresh_knowledge_sync_status)
         self.observer_task = asyncio.create_task(self._observe())
         self.clipboard_task = asyncio.create_task(self._watch_clipboard())
         asyncio.create_task(self._run_boot_sequence())
+        self._refresh_knowledge_sync_status()
         if hasattr(self.engine, "set_web_search_callback"):
             self.engine.set_web_search_callback(self._on_web_search_state)
 
@@ -160,6 +166,16 @@ class CerealKillerApp(App[None]):
                 self._run_vision_worker(str(upload_path), source_label="/upload")
             else:
                 dashboard.append_system("Upload command did not provide a path.", style="red")
+            return
+        if result.session_prefix == "__search__":
+            if result.search_query:
+                self._run_search_worker(result.search_query)
+            else:
+                dashboard.append_system("Search command did not provide a query.", style="red")
+            return
+        if result.session_prefix == "__sync_all__":
+            self.notify("Sync-all launched. Knowledge bar will update after ingest.", title="Sync Status", severity="information")
+            self._refresh_knowledge_sync_status()
             return
 
         dashboard.set_active_tool("Idle")
@@ -249,6 +265,45 @@ class CerealKillerApp(App[None]):
             dashboard.set_active_tool("Idle")
             self._analysis_busy(False)
 
+    @work(exclusive=True, thread=False, group="llm")
+    async def _run_search_worker(self, query: str) -> None:
+        dashboard = self._dashboard()
+        self._analysis_busy(True)
+        dashboard.set_active_tool("Search")
+        self.notify(
+            f"Searching local Gibson memory for '{query}'...",
+            title="Search Status",
+            severity="information",
+        )
+        dashboard.append_system(f"Searching local Gibson memory for '{query}'...", style="bold cyan")
+        try:
+            source_filters = self._extract_source_filters(query)
+            search_result = await tiered_search(
+                query=query,
+                settings=self.kb.settings,
+                history_commands=[],
+                target_machine=None,
+                allow_web=False,
+                force_web=False,
+                top_k=6,
+                source_filters=source_filters,
+            )
+            response = await self.engine.synthesize_search_results(query, search_result.vector_snippets)
+            labeled_answer = f"## [SEARCH RESULT]\n\n{response.answer.strip()}"
+            await self._consume_llm_response(labeled_answer, response.reasoning_content or response.thought)
+        except Exception as exc:
+            dashboard.append_system(f"Search error: {exc}", style="red")
+        finally:
+            dashboard.set_active_tool("Idle")
+            self._analysis_busy(False)
+
+    @staticmethod
+    def _extract_source_filters(query: str) -> list[str] | None:
+        match = SEARCH_SOURCE_FILTER_RE.search(query)
+        if not match:
+            return None
+        return [match.group(1).strip().lower()]
+
     async def _consume_llm_response(self, answer: str, thought: str) -> None:
         dashboard = self._dashboard()
         try:
@@ -283,42 +338,59 @@ class CerealKillerApp(App[None]):
         cwd = str(Path.cwd())
         dashboard = self._dashboard()
         last_auto_coach_time: float = 0.0
+        terminal_link_online = False
 
-        async for event in observe_history_events(cwd):
-            if event.json_hint:
-                self._append_chat("assistant", event.json_hint)
-                dashboard.append_assistant(event.json_hint)
-                continue
+        try:
+            async for event in observe_history_events(cwd):
+                # Set terminal link ONLINE on first successful event
+                if not terminal_link_online:
+                    dashboard.set_terminal_link_online(True)
+                    terminal_link_online = True
+                
+                if event.json_hint:
+                    self._append_chat("assistant", event.json_hint)
+                    dashboard.append_assistant(event.json_hint)
+                    continue
 
-            if not event.command:
-                continue
+                if not event.command:
+                    continue
 
-            self.history_context = event.context_commands
-            phase = detect_phase(self.history_context)
-            dashboard.set_phase(phase)
-            self.engine.record_phase_change(phase)
-            self.engine.record_command_progress()
+                # Pulse terminal link to show data is flowing
+                await dashboard.pulse_terminal_link()
 
-            audit_warning = audit_methodology(event.command, self.history_context)
-            if audit_warning:
-                dashboard.append_system(audit_warning, style="bold red")
-                self._append_chat("assistant", audit_warning)
+                self.history_context = event.context_commands
+                phase = detect_phase(self.history_context)
+                dashboard.set_phase(phase)
+                self.engine.record_phase_change(phase)
+                self.engine.record_command_progress()
 
-            inferred_target = event.cd_target or event.host_target
-            if inferred_target and inferred_target != self.current_target:
-                auto_cmd = f"/box {inferred_target}"
-                cmd_result = await dispatch_command(auto_cmd, self.engine, self.kb.settings)
-                if cmd_result is not None:
-                    await self._apply_command_result(cmd_result)
+                audit_warning = audit_methodology(event.command, self.history_context)
+                if audit_warning:
+                    dashboard.append_system(audit_warning, style="bold red")
+                    self._append_chat("assistant", audit_warning)
 
-            if not event.trigger_brain:
-                continue
+                inferred_target = event.cd_target or event.host_target
+                if inferred_target and inferred_target != self.current_target:
+                    auto_cmd = f"/box {inferred_target}"
+                    cmd_result = await dispatch_command(auto_cmd, self.engine, self.kb.settings)
+                    if cmd_result is not None:
+                        await self._apply_command_result(cmd_result)
 
-            now = _time.monotonic()
-            if now - last_auto_coach_time < _AUTO_COACH_COOLDOWN_SECS:
-                continue
-            last_auto_coach_time = now
-            self._run_autocoach_worker(event.command)
+                if not event.trigger_brain:
+                    continue
+
+                now = _time.monotonic()
+                if now - last_auto_coach_time < _AUTO_COACH_COOLDOWN_SECS:
+                    continue
+                last_auto_coach_time = now
+                self._run_autocoach_worker(event.command)
+        except RuntimeError as e:
+            # Permission error or other startup issue
+            dashboard.set_terminal_link_online(False)
+            error_msg = f"[red]Terminal Link Failed:[/red] {str(e)}"
+            self._append_chat("system", error_msg)
+            dashboard.append_system(error_msg, style="bold red")
+            raise
 
     async def _watch_clipboard(self) -> None:
         async for detected in self.clipboard_watcher.watch():
@@ -368,12 +440,22 @@ class CerealKillerApp(App[None]):
         dashboard = self._dashboard()
         dashboard.set_active_tool("Web Search" if active else "Idle")
 
+    def _refresh_knowledge_sync_status(self) -> None:
+        try:
+            statuses = fetch_sync_status(self.kb.settings, ["ippsec", "gtfobins", "lolbas", "hacktricks", "payloads"])
+            self._dashboard().set_knowledge_sync_status(statuses)
+        except Exception:
+            return
+
     @on(Button.Pressed, "#easy_button")
     def show_walkthrough(self) -> None:
         self._record_easy_usage()
         machine_name = Path.cwd().name
         solution_markdown = retrieve_solution_for_machine(self.kb.settings, machine_name)
         self.push_screen(SolutionModal(solution_markdown))
+        
+        # Attempt to open IppSec YouTube link if available
+        self._open_ippsec_link(machine_name)
 
     def action_pulse_easy_button(self) -> None:
         easy_button = self._get_easy_button()
@@ -513,6 +595,23 @@ class CerealKillerApp(App[None]):
     def _record_easy_usage(self, weight: int = 1) -> None:
         self.easy_usage_count += max(1, weight)
         self._adjust_pathetic_meter()
+
+    def _open_ippsec_link(self, machine_name: str) -> None:
+        """Open IppSec YouTube video link in default browser."""
+        try:
+            # Try to find IppSec video metadata from knowledge base
+            # Construct ippsec.rocks link: https://ippsec.rocks/?n=MachineName
+            machine_safe = machine_name.replace("_", "-").replace(" ", "-").lower()
+            url = f"https://ippsec.rocks/?n={machine_safe}"
+            
+            # Open in default browser using xdg-open (Linux) or open (Mac)
+            opener = "xdg-open" if shutil.which("xdg-open") else ("open" if shutil.which("open") else None)
+            if opener:
+                subprocess.Popen([opener, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self._dashboard().append_system(f"📺 Opened IppSec video: {url}", style="dim cyan")
+        except Exception:
+            # Silently fail if browser can't be opened
+            pass
 
     def _update_header_target(self, target: str | None = None) -> None:
         active_target = (target or self.current_target or "NONE").upper()
