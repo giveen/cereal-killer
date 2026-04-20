@@ -20,7 +20,8 @@ class KnowledgeBaseTransformTests(unittest.TestCase):
         self.assertEqual(len(docs), 1)
         doc = docs[0]
         self.assertEqual(doc["machine"], "Cap")
-        self.assertIn("line: command injection in /ip", doc["content"])
+        self.assertIn("phase: user", doc["content"])
+        self.assertIn("line: - command injection in /ip", doc["content"])
         self.assertIn("video_id: abc123", doc["content"])
         self.assertIn("timestamp_seconds: 90", doc["content"])
         self.assertIn("youtube.com/watch?v=abc123&t=90s", doc["url"])

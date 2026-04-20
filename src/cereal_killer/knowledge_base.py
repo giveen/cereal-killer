@@ -105,6 +105,18 @@ def transform_dataset(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
             return max(0, minutes * 60 + seconds)
         return 0
 
+    def _infer_phase(line_text: str) -> str:
+        lowered = (line_text or "").lower()
+        if any(token in lowered for token in ("linpeas", "setuid", "sudo", "root", "privesc")):
+            return "root"
+        if any(token in lowered for token in ("command injection", "reverse shell", "foothold", "ftp creds", "sshing", "exploit")):
+            return "user"
+        if any(token in lowered for token in ("nmap", "enum", "gobuster", "scan", "dirb", "ferox")):
+            return "recon"
+        return "recon"
+
+    entries: list[dict[str, Any]] = []
+
     for idx, item in enumerate(data):
         machine_raw = str(item.get("machine", item.get("name", "unknown")))
         machine = _normalize_machine(machine_raw)
@@ -118,29 +130,75 @@ def transform_dataset(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not url and video_id:
             url = f"https://www.youtube.com/watch?v={video_id}&t={timestamp_secs}s"
 
-        content_parts = [
-            f"machine: {machine}",
-            f"source_machine: {machine_raw}",
-            f"title: {title}",
-            f"line: {line}" if line else "",
-            f"tag: {tag}" if tag else "",
-            f"academy: {academy}" if academy else "",
-            f"video_id: {video_id}" if video_id else "",
-            f"timestamp_seconds: {timestamp_secs}" if timestamp_secs else "",
-            url,
-        ]
-        content = "\n".join(part for part in content_parts if part).strip()
-
-        docs.append(
+        entries.append(
             {
-                "id": f"ippsec-{idx}",
+                "idx": idx,
                 "machine": machine,
+                "machine_raw": machine_raw,
                 "title": title,
                 "url": url,
-                "content": content,
-                "embedding": _vector_to_bytes(KnowledgeBase.embed(content)),
+                "line": line,
+                "tag": tag,
+                "academy": academy,
+                "video_id": video_id,
+                "timestamp_seconds": timestamp_secs,
+                "phase": _infer_phase(line),
             }
         )
+
+    # Semantic sliding chunking by machine+phase to keep retrieval focused.
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for item in entries:
+        grouped.setdefault((item["machine"], item["phase"]), []).append(item)
+
+    doc_id = 0
+    window_size = 4
+    stride = 2
+    for (machine, phase), group_items in grouped.items():
+        group_items.sort(key=lambda x: (int(x.get("timestamp_seconds", 0)), int(x.get("idx", 0))))
+        if not group_items:
+            continue
+        for start in range(0, len(group_items), stride):
+            window = group_items[start:start + window_size]
+            if not window:
+                continue
+            first = window[0]
+            url = str(first.get("url", ""))
+            title = str(first.get("title", "walkthrough"))
+            lines_blob = "\n".join(f"- {w.get('line','').strip()}" for w in window if str(w.get("line", "")).strip())
+            tags = ", ".join(sorted({str(w.get("tag", "")).strip() for w in window if str(w.get("tag", "")).strip()}))
+            min_ts = min(int(w.get("timestamp_seconds", 0)) for w in window)
+            max_ts = max(int(w.get("timestamp_seconds", 0)) for w in window)
+            video_id = str(first.get("video_id", "")).strip()
+            academy = str(first.get("academy", "")).strip()
+            content_parts = [
+                f"machine: {machine}",
+                f"source_machine: {first.get('machine_raw', machine)}",
+                f"phase: {phase}",
+                f"title: {title}",
+                f"tag: {tags}" if tags else "",
+                f"academy: {academy}" if academy else "",
+                f"video_id: {video_id}" if video_id else "",
+                f"timestamp_seconds: {min_ts}",
+                f"timestamp_end_seconds: {max_ts}",
+                f"line: {lines_blob}" if lines_blob else "",
+                url,
+            ]
+            content = "\n".join(part for part in content_parts if part).strip()
+            docs.append(
+                {
+                    "id": f"ippsec-{doc_id}",
+                    "machine": machine,
+                    "title": title,
+                    "url": url,
+                    "content": content,
+                    "embedding": _vector_to_bytes(KnowledgeBase.embed(content)),
+                }
+            )
+            doc_id += 1
+
+            if start + window_size >= len(group_items):
+                break
     return docs
 
 
@@ -162,6 +220,14 @@ def sync_ippsec_dataset() -> None:
     index = kb.index()
     # Keep existing index configuration/data unless it does not exist yet.
     index.create(overwrite=False, drop=False)
+    # Replace document set on each sync so schema/content upgrades take effect.
+    try:
+        # redisvl exposes a redis-py compatible client on .client
+        stale_keys = list(index.client.scan_iter(match=f"{settings.redis_index}:*"))
+        if stale_keys:
+            index.client.delete(*stale_keys)
+    except Exception:
+        pass
     if docs:
         index.load(docs, id_field="id")
     print(f"Synced {len(docs)} entries into {settings.redis_index}")

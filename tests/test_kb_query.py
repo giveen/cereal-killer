@@ -1,6 +1,6 @@
 import unittest
 
-from mentor.kb.query import RAGSnippet, retrieve_reference_material
+from mentor.kb.query import RAGSnippet, _canonical_machine, _summarize_snippet, retrieve_reference_material
 
 
 class QueryPrioritizationTests(unittest.TestCase):
@@ -15,7 +15,7 @@ class QueryPrioritizationTests(unittest.TestCase):
         # query path with pre-cooked snippets.
         import mentor.kb.query as q
 
-        def fake_query_single_index(settings, index_name, query, limit):  # type: ignore[no-untyped-def]
+        def fake_query_single_index(settings, index_name, query, limit, machine_filter=None):  # type: ignore[no-untyped-def]
             return snippets
 
         original = q._query_single_index
@@ -32,7 +32,15 @@ class QueryPrioritizationTests(unittest.TestCase):
             q._query_single_index = original  # type: ignore[assignment]
 
         self.assertEqual(len(result), 2)
-        self.assertTrue(all(item.machine.lower() == "cap" for item in result))
+        self.assertTrue(all(_canonical_machine(item.machine) == "cap" for item in result))
+
+    def test_summary_preprocessor_outputs_bullets(self) -> None:
+        summary = _summarize_snippet(
+            "machine: Cap\nphase: user\nline: Command injection works\ntag: linux easy\n"
+            "video_id: abc\ntimestamp_seconds: 120\nhttps://example.com"
+        )
+        self.assertIn("- phase: user", summary)
+        self.assertIn("- line: Command injection works", summary)
 
 
 if __name__ == "__main__":
