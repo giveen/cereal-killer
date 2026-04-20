@@ -15,7 +15,12 @@ from mentor.observer.stalker import (
     parse_history_lines,
 )
 
-from .vision_watcher import ClipboardImageDetected, ClipboardImageWatcher, clear_clipboard_buffer
+from .vision_watcher import (
+    ClipboardImageDetected,
+    ClipboardImageWatcher,
+    ascii_preview_for_image,
+    clear_clipboard_buffer,
+)
 
 
 async def observe_history(cwd: str) -> AsyncIterator[list[str]]:
@@ -42,5 +47,6 @@ __all__ = [
     "observe_history_events",
     "ClipboardImageDetected",
     "ClipboardImageWatcher",
+    "ascii_preview_for_image",
     "clear_clipboard_buffer",
 ]

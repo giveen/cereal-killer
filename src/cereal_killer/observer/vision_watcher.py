@@ -121,3 +121,13 @@ def clear_clipboard_buffer(path: Path | None = None) -> bool:
         return True
     except Exception:
         return False
+
+
+def ascii_preview_for_image(path: Path) -> str:
+    if Image is None:
+        return ""
+    try:
+        with Image.open(path) as image:
+            return ClipboardImageWatcher._ascii_preview(image)
+    except Exception:
+        return ""

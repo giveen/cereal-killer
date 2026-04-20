@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import re
+from pathlib import Path
 from urllib.parse import quote, unquote
 
 from textual import on
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, Markdown, RichLog, Static
+from textual.widgets import Button, Collapsible, DirectoryTree, LoadingIndicator, Markdown, RichLog, Static
 
 from mentor.utils.clipboard import copy_text
 
@@ -88,6 +89,9 @@ class MainDashboard(Screen[None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="dashboard"):
             with Horizontal(id="main_row"):
+                with Vertical(id="explorer_pane"):
+                    with Collapsible(title="Directory Upload", collapsed=False, id="upload_collapsible"):
+                        yield DirectoryTree(str(Path.cwd()), id="upload_tree")
                 with Vertical(id="left_pane"):
                     yield RichLog(id="chat_log", markup=True, wrap=True, highlight=True)
                     yield Static("LATEST RESPONSE", id="response_title")
@@ -95,6 +99,7 @@ class MainDashboard(Screen[None]):
                     with Horizontal(id="response_actions"):
                         yield Button("Copy Response", id="copy_response", variant="default")
                         yield Button("Copy Code", id="copy_code", variant="primary")
+                        yield LoadingIndicator(id="analysis_loading")
                 yield SidebarStatus()
             with Horizontal(id="bottom_row"):
                 yield CommandInput()
@@ -156,10 +161,31 @@ class MainDashboard(Screen[None]):
 
     def apply_responsive_layout(self, width: int) -> None:
         sidebar = self.query_one("#intel_sidebar", Vertical)
+        explorer = self.query_one("#explorer_pane", Vertical)
         if width < 120:
             sidebar.add_class("hidden")
+            explorer.add_class("hidden")
         else:
             sidebar.remove_class("hidden")
+            explorer.remove_class("hidden")
+
+    def toggle_upload_tree(self) -> None:
+        explorer = self.query_one("#explorer_pane", Vertical)
+        if explorer.has_class("hidden"):
+            explorer.remove_class("hidden")
+        else:
+            explorer.add_class("hidden")
+
+    def set_upload_root(self, root_path: Path) -> None:
+        tree = self.query_one("#upload_tree", DirectoryTree)
+        target = root_path.expanduser().resolve()
+        tree.path = target
+        tree.root.label = str(target)
+        tree.reload()
+
+    def set_loading(self, active: bool) -> None:
+        indicator = self.query_one("#analysis_loading", LoadingIndicator)
+        indicator.display = active
 
     def _update_response_markdown(self, text: str) -> None:
         self._last_response_raw = text or ""

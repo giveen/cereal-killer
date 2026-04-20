@@ -14,7 +14,8 @@ Adding a new command
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 from cereal_killer.config import Settings
@@ -43,6 +44,8 @@ class CommandResult:
     system_prompt_addendum: str | None = None
     # Phase should reset on the UI side.
     reset_phase: bool = False
+    # Optional image path used by /upload flow.
+    upload_image_path: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +190,7 @@ async def _cmd_help(args: list[str], engine: object, settings: Settings) -> Comm
         "  [cyan]/box <name>[/cyan]         — Load IppSec context for a known box",
         "  [cyan]/new-box <name>[/cyan]     — Start exploration mode for an unknown box",
         "  [cyan]/vision[/cyan]             — Analyze latest clipboard screenshot",
+        "  [cyan]/upload <path>[/cyan]      — Analyze a specific image file",
         "  [cyan]/loot[/cyan]               — Generate a loot report for the current box",
         "  [cyan]/victory <text>[/cyan]     — Record post-pwn explanation in learnings vault",
         "  [cyan]/clear[/cyan]              — Clear the current box session from Redis",
@@ -216,6 +220,34 @@ async def _cmd_vision(args: list[str], engine: object, settings: Settings) -> Co
         context_loaded=False,
         exploration_mode=False,
         session_prefix="__vision__",
+    )
+
+
+async def _cmd_upload(args: list[str], engine: object, settings: Settings) -> CommandResult:
+    """Analyze an explicit image file path via the multimodal model path."""
+    if not args:
+        return CommandResult(
+            message="[yellow]Usage:[/yellow] /upload <path-to-image>",
+        )
+
+    raw_path = " ".join(args).strip()
+    expanded = os.path.expanduser(raw_path)
+    absolute = os.path.abspath(expanded)
+    if not os.path.exists(absolute):
+        return CommandResult(message=f"[red]Upload failed:[/red] file not found: {absolute}")
+    if not os.path.isfile(absolute):
+        return CommandResult(message=f"[red]Upload failed:[/red] not a file: {absolute}")
+
+    lowered = absolute.lower()
+    if not lowered.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")):
+        return CommandResult(
+            message="[red]Upload failed:[/red] only image files are supported (.png/.jpg/.jpeg/.webp/.bmp/.gif)"
+        )
+
+    return CommandResult(
+        message=f"[green]Image uploaded:[/green] {absolute}",
+        session_prefix="__upload__",
+        upload_image_path=absolute,
     )
 
 
@@ -307,6 +339,7 @@ _REGISTRY: dict[str, _Handler] = {
     "new-box": _cmd_new_box,
     "newbox": _cmd_new_box,      # typo-tolerant alias
     "vision": _cmd_vision,
+    "upload": _cmd_upload,
     "loot": _cmd_loot,
     "exit": _cmd_exit,
     "quit": _cmd_exit,

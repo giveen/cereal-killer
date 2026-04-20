@@ -12,6 +12,26 @@ Screen {
     height: 1fr;
 }
 
+#explorer_pane {
+    width: 1fr;
+    min-width: 30;
+    height: 1fr;
+    border: tall #4f7a5e;
+    background: #0b1410;
+    padding: 1;
+    margin-right: 1;
+}
+
+#upload_collapsible {
+    height: 1fr;
+}
+
+#upload_tree {
+    height: 1fr;
+    border: tall #4fd2ff;
+    background: #08121d;
+}
+
 #left_pane {
     width: 2fr;
     min-width: 60;
@@ -48,11 +68,17 @@ Screen {
 #response_actions {
     height: auto;
     margin-top: 1;
+    align: left middle;
 }
 
 #copy_response,
 #copy_code {
     margin-right: 1;
+}
+
+#analysis_loading {
+    width: 3;
+    display: none;
 }
 
 #thought_box {

@@ -88,24 +88,58 @@ async def _check_llm_endpoint(settings: Settings) -> CheckResult:
                 "skipping pre-flight check. Hope you know what you're doing."
             ),
         )
-    url = settings.llm_base_url.rstrip("/") + "/models"
+    base_url = (settings.llm_vision_base_url or settings.llm_base_url).rstrip("/")
+    url = base_url + "/models"
     try:
         async with httpx.AsyncClient(timeout=4.0) as client:
             resp = await client.get(
                 url, headers={"Authorization": f"Bearer {settings.llm_api_key}"}
             )
         if resp.status_code < 400:
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = {}
+
+            model_ids: list[str] = []
+            if isinstance(payload, dict):
+                data = payload.get("data")
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and item.get("id"):
+                            model_ids.append(str(item["id"]).lower())
+
+            vision_hints = (
+                "qwen2-vl",
+                "qwen3-vl",
+                "vl",
+                "vision",
+                "llava",
+                "internvl",
+                "pixtral",
+            )
+            has_vision = any(any(hint in mid for hint in vision_hints) for mid in model_ids)
+            if not has_vision:
+                return CheckResult(
+                    label="LLM",
+                    ok=False,
+                    message=(
+                        "[yellow][WARN][/yellow] [b]llama-swap[/b] — reachable, but no vision model looks active. "
+                        "I'm currently blind. Go to llama-swap and load the vision projector if you want me to look at that."
+                    ),
+                )
+
             return CheckResult(
                 label="LLM",
                 ok=True,
-                message="[green][ OK ][/green] [b]llama.cpp[/b] — the brain has a brain.",
+                message="[green][ OK ][/green] [b]llama-swap[/b] — vision model online and ready.",
             )
         return CheckResult(
             label="LLM",
             ok=False,
             message=(
-                f"[red][FAIL][/red] [b]llama.cpp[/b] — HTTP {resp.status_code}. "
-                "Is the server running with --jinja --reasoning-parser qwen3?"
+                f"[red][FAIL][/red] [b]llama-swap[/b] — HTTP {resp.status_code}. "
+                "Is /v1/models reachable and does it have an active model?"
             ),
         )
     except Exception as exc:
@@ -113,7 +147,7 @@ async def _check_llm_endpoint(settings: Settings) -> CheckResult:
             label="LLM",
             ok=False,
             message=(
-                f"[red][FAIL][/red] [b]llama.cpp[/b] — can't reach {settings.llm_base_url}. "
+                f"[red][FAIL][/red] [b]llama-swap[/b] — can't reach {base_url}. "
                 f"No LLM, no coaching, just vibes. ({exc})"
             ),
         )

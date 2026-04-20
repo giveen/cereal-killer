@@ -356,8 +356,16 @@ class Brain:
         if isinstance(metadata, dict):
             metadata["machine"] = machine_name
 
-        if self._client is None:
-            raise RuntimeError("No LLM client available for multimodal call.")
+        # Vision calls are pinned to llama-swap's OpenAI-compatible endpoint.
+        # Payload format: user content is a list of text + image_url parts.
+        try:
+            import httpx  # type: ignore[import-untyped]
+        except Exception as exc:
+            raise RuntimeError("httpx is required for llama-swap vision calls") from exc
+
+        vision_base = (self.settings.llm_vision_base_url or self.settings.llm_base_url).rstrip("/")
+        vision_model = (self.settings.llm_vision_model or self.settings.llm_model).strip()
+        endpoint = f"{vision_base}/chat/completions"
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
@@ -376,16 +384,35 @@ class Brain:
 
         messages = self._dedupe_messages(messages)
 
-        completion = await self._client.chat.completions.create(
-            model=self.settings.llm_model,
-            messages=messages,
-            temperature=0.4,
-            extra_body=extra_body,
-        )
-        message = completion.choices[0].message
+        payload: dict[str, Any] = {
+            "model": vision_model,
+            "messages": messages,
+            "temperature": 0.4,
+            "extra_body": extra_body,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.settings.llm_api_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(endpoint, headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+        except Exception as exc:
+            raise RuntimeError(f"llama-swap vision call failed via {endpoint}: {exc}") from exc
+
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("llama-swap vision response missing choices")
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        message = first.get("message") if isinstance(first, dict) else {}
+        if not isinstance(message, dict):
+            message = {}
+
         return self._normalise_completion_payload(
-            message.content or "",
-            getattr(message, "reasoning_content", "") or "",
+            str(message.get("content") or ""),
+            str(message.get("reasoning_content") or ""),
         )
 
     @staticmethod

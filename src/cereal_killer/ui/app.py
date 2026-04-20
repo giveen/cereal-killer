@@ -4,21 +4,23 @@ import asyncio
 import difflib
 import json
 import re
+import shutil
 import time as _time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from textual import on
+from textual import on, work
 from textual.app import App
 from textual.css.query import NoMatches
 from textual.events import Resize
-from textual.widgets import Button, Input
+from textual.widgets import Button, DirectoryTree, Input
 
 from cereal_killer.engine import LLMEngine
 from cereal_killer.knowledge_base import KnowledgeBase
 from cereal_killer.observer import (
     ClipboardImageDetected,
     ClipboardImageWatcher,
+    ascii_preview_for_image,
     clear_clipboard_buffer,
     observe_history_events,
 )
@@ -39,6 +41,7 @@ VISION_PROMPT = (
     "Zero Cool, I've just pasted a screenshot. "
     "Look at the error/output and tell me where I'm failing."
 )
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 
 
 class CerealKillerApp(App[None]):
@@ -46,6 +49,7 @@ class CerealKillerApp(App[None]):
     BINDINGS = [
         ("ctrl+c", "quit", "Quit"),
         ("ctrl+b", "pulse_easy_button", "Easy Button"),
+        ("u", "toggle_upload_tree", "Toggle Upload Tree"),
     ]
 
     def __init__(self, engine: LLMEngine, kb: KnowledgeBase) -> None:
@@ -65,6 +69,8 @@ class CerealKillerApp(App[None]):
         self.chat_transcript: list[dict[str, str]] = []
         self.current_target: str = ""
         self._pruning_in_flight = False
+        self._analysis_jobs = 0
+        self._uploaded_image_path: Path | None = None
 
     def _dashboard(self) -> MainDashboard:
         screen = self.screen
@@ -74,8 +80,11 @@ class CerealKillerApp(App[None]):
 
     async def on_mount(self) -> None:
         await self.push_screen(MainDashboard())
-        self._dashboard().apply_responsive_layout(self.size.width)
-        self._dashboard().set_phase("[IDLE]")
+        dashboard = self._dashboard()
+        dashboard.apply_responsive_layout(self.size.width)
+        dashboard.set_phase("[IDLE]")
+        dashboard.set_upload_root(Path.cwd())
+        dashboard.set_loading(False)
         self.set_interval(0.7, self._pulse_easy_button)
         self.set_interval(300, self._schedule_persist_mental_state)
         self.set_interval(60, self._schedule_context_prune)
@@ -113,108 +122,150 @@ class CerealKillerApp(App[None]):
             dashboard.set_active_tool("CommandProcessor")
             asyncio.create_task(self._handle_command(prompt))
         else:
-            dashboard.set_active_tool("Brain")
-            asyncio.create_task(self._handle_brain_prompt(prompt))
+            self._run_chat_worker(prompt)
+
+    @on(DirectoryTree.FileSelected, "#upload_tree")
+    def on_upload_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
+        path = Path(event.path)
+        if not self._is_image_file(path):
+            self.notify("Select an image file to analyze", title="Upload", severity="warning")
+            return
+        self._prime_uploaded_image(path, source="DirectoryTree")
+        self._run_vision_worker(str(path), source_label="DirectoryTree")
+
+    def action_toggle_upload_tree(self) -> None:
+        self._dashboard().toggle_upload_tree()
 
     async def _handle_command(self, prompt: str) -> None:
         dashboard = self._dashboard()
         result = await dispatch_command(prompt, self.engine, self.kb.settings)
         if result is None:
-            await self._handle_brain_prompt(prompt)
+            self._run_chat_worker(prompt)
             return
+
         await self._apply_command_result(result)
         if result.session_prefix == "__exit__":
             self.exit()
             return
         if result.session_prefix == "__loot__":
-            await self._handle_loot_report()
+            self._run_loot_worker()
+            return
         if result.session_prefix == "__vision__":
-            await self._handle_vision_report()
+            self._run_vision_worker(str(VISION_BUFFER_PATH), source_label="Clipboard")
+            return
+        if result.session_prefix == "__upload__":
+            if result.upload_image_path:
+                upload_path = Path(result.upload_image_path)
+                self._prime_uploaded_image(upload_path, source="/upload")
+                self._run_vision_worker(str(upload_path), source_label="/upload")
+            else:
+                dashboard.append_system("Upload command did not provide a path.", style="red")
+            return
+
         dashboard.set_active_tool("Idle")
 
-    async def _handle_vision_report(self) -> None:
+    @work(exclusive=True, thread=False, group="llm")
+    async def _run_chat_worker(self, prompt: str) -> None:
         dashboard = self._dashboard()
-        if not VISION_BUFFER_PATH.exists():
-            dashboard.append_system(
-                "No clipboard screenshot captured yet. Copy an image and retry /vision.",
-                style="yellow",
-            )
-            return
-
-        dashboard.set_active_tool("Vision")
-        dashboard.append_system(
-            f"Analyzing screenshot from {VISION_BUFFER_PATH.name}...",
-            style="bold green",
-        )
-        try:
-            response = await self.engine.chat_with_image(
-                user_prompt=VISION_PROMPT,
-                image_path=str(VISION_BUFFER_PATH),
-                history_commands=self.history_context,
-                pathetic_meter=self.pathetic_meter,
-            )
-        except Exception as exc:
-            dashboard.append_system(f"Vision analysis error: {exc}", style="red")
-            dashboard.set_active_tool("Idle")
-            return
-
-        try:
-            await self._safe_stream_thought(response.reasoning_content or response.thought)
-            self._track_code_block(response.answer)
-            self._warn_if_repetitive_response(response.answer)
-            self._append_chat("assistant", response.answer)
-            dashboard.append_assistant(response.answer)
-        except Exception as exc:
-            dashboard.append_system(f"Vision UI error: {exc}", style="red")
-        finally:
-            dashboard.set_active_tool("Idle")
-
-    async def _handle_brain_prompt(self, prompt: str) -> None:
-        dashboard = self._dashboard()
+        self._analysis_busy(True)
+        dashboard.set_active_tool("Brain")
         try:
             response = await self.engine.chat(
                 prompt,
                 self.history_context,
                 pathetic_meter=self.pathetic_meter,
             )
-        except Exception as exc:
-            dashboard.append_system(f"LLM error: {exc}", style="red")
-            dashboard.set_active_tool("Idle")
-            return
-        try:
-            await self._safe_stream_thought(response.reasoning_content or response.thought)
-            self._track_code_block(response.answer)
-            self._warn_if_repetitive_response(response.answer)
-            self._append_chat("assistant", response.answer)
-            dashboard.append_assistant(response.answer)
+            await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
             phase = detect_phase(self.history_context)
             dashboard.set_phase(phase)
             if "pwned" in prompt.lower() or "owned" in prompt.lower():
                 self._save_session_snapshot("pwned-manual")
         except Exception as exc:
-            dashboard.append_system(f"UI post-processing error: {exc}", style="red")
+            dashboard.append_system(f"LLM error: {exc}", style="red")
         finally:
             dashboard.set_active_tool("Idle")
+            self._analysis_busy(False)
 
-    async def _handle_loot_report(self) -> None:
+    @work(exclusive=True, thread=False, group="llm")
+    async def _run_loot_worker(self) -> None:
         dashboard = self._dashboard()
         machine_name = Path.cwd().name
+        self._analysis_busy(True)
+        dashboard.set_active_tool("Loot")
         dashboard.append_system(f"Generating loot report for {machine_name}...", style="bold green")
         try:
             response = await self.engine.generate_loot_report(
                 history_commands=self.history_context,
                 pathetic_meter=self.pathetic_meter,
             )
+            await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
         except Exception as exc:
             dashboard.append_system(f"Loot report error: {exc}", style="red")
+        finally:
+            dashboard.set_active_tool("Idle")
+            self._analysis_busy(False)
+
+    @work(exclusive=True, thread=False, group="llm")
+    async def _run_vision_worker(self, image_path: str, source_label: str = "Clipboard") -> None:
+        dashboard = self._dashboard()
+        image_file = Path(image_path)
+        if not image_file.exists():
+            dashboard.append_system(f"Vision input missing: {image_file}", style="yellow")
             return
+
+        self._analysis_busy(True)
+        dashboard.set_active_tool("Vision")
+        dashboard.append_system(f"Image Uploaded: {image_file.name} ({source_label})", style="bold cyan")
+        dashboard.append_system(f"Zero Cool is analyzing {image_file.name}...", style="bold green")
         try:
-            await self._safe_stream_thought(response.reasoning_content or response.thought)
-            self._warn_if_repetitive_response(response.answer)
-            dashboard.append_assistant(response.answer)
-            self._append_chat("assistant", response.answer)
+            response = await self.engine.chat_with_image(
+                user_prompt=VISION_PROMPT,
+                image_path=str(image_file),
+                history_commands=self.history_context,
+                pathetic_meter=self.pathetic_meter,
+            )
+            await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
         except Exception as exc:
-            dashboard.append_system(f"Loot report UI error: {exc}", style="red")
+            dashboard.append_system(f"Vision analysis error: {exc}", style="red")
+        finally:
+            dashboard.set_active_tool("Idle")
+            self._analysis_busy(False)
+
+    @work(exclusive=True, thread=False, group="llm")
+    async def _run_autocoach_worker(self, command: str) -> None:
+        dashboard = self._dashboard()
+        self._analysis_busy(True)
+        dashboard.set_active_tool("Brain")
+        try:
+            response = await self.engine.react_to_command(
+                command,
+                self.history_context,
+                pathetic_meter=self.pathetic_meter,
+            )
+            await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
+        except Exception as exc:
+            dashboard.append_system(f"Auto-coach error: {exc}", style="red")
+        finally:
+            dashboard.set_active_tool("Idle")
+            self._analysis_busy(False)
+
+    async def _consume_llm_response(self, answer: str, thought: str) -> None:
+        dashboard = self._dashboard()
+        try:
+            await self._safe_stream_thought(thought)
+            self._track_code_block(answer)
+            self._warn_if_repetitive_response(answer)
+            self._append_chat("assistant", answer)
+            dashboard.append_assistant(answer)
+        except Exception as exc:
+            dashboard.append_system(f"UI post-processing error: {exc}", style="red")
+
+    def _analysis_busy(self, active: bool) -> None:
+        if active:
+            self._analysis_jobs += 1
+        else:
+            self._analysis_jobs = max(0, self._analysis_jobs - 1)
+        self._dashboard().set_loading(self._analysis_jobs > 0)
 
     async def _run_boot_sequence(self) -> None:
         dashboard = self._dashboard()
@@ -231,7 +282,7 @@ class CerealKillerApp(App[None]):
     async def _observe(self) -> None:
         cwd = str(Path.cwd())
         dashboard = self._dashboard()
-        _last_auto_coach_time: float = 0.0
+        last_auto_coach_time: float = 0.0
 
         async for event in observe_history_events(cwd):
             if event.json_hint:
@@ -264,20 +315,10 @@ class CerealKillerApp(App[None]):
                 continue
 
             now = _time.monotonic()
-            if now - _last_auto_coach_time < _AUTO_COACH_COOLDOWN_SECS:
+            if now - last_auto_coach_time < _AUTO_COACH_COOLDOWN_SECS:
                 continue
-            _last_auto_coach_time = now
-
-            dashboard.set_active_tool("Brain")
-            try:
-                response = await self.engine.react_to_command(
-                    event.command,
-                    self.history_context,
-                    pathetic_meter=self.pathetic_meter,
-                )
-            except Exception as exc:
-                dashboard.append_system(f"Auto-coach error: {exc}", style="red")
-                dashboard.set_active_tool("Idle")
+            last_auto_coach_time = now
+            self._run_autocoach_worker(event.command)
 
     async def _watch_clipboard(self) -> None:
         async for detected in self.clipboard_watcher.watch():
@@ -285,17 +326,9 @@ class CerealKillerApp(App[None]):
 
     def on_clipboard_image_detected(self, message: ClipboardImageDetected) -> None:
         snapshot = message.snapshot
-        dims = ""
-        try:
-            from PIL import Image
-
-            with Image.open(snapshot.image_path) as image:
-                dims = f" ({image.width}x{image.height})"
-        except Exception:
-            dims = ""
-
-        description = f"{snapshot.image_path.name}{dims}"
+        description = f"{snapshot.image_path.name}"
         self._dashboard().set_visual_buffer(description, snapshot.preview)
+        self._uploaded_image_path = snapshot.image_path
         self.notify(
             f"Clipboard image buffered as {snapshot.image_path.name}",
             title="Visual Buffer",
@@ -306,22 +339,30 @@ class CerealKillerApp(App[None]):
     def clear_visual_buffer(self) -> None:
         ok = clear_clipboard_buffer(VISION_BUFFER_PATH)
         self._dashboard().clear_visual_buffer()
+        self._uploaded_image_path = None
         if ok:
             self.notify("Visual buffer cleared", title="Visual Buffer", severity="information")
         else:
             self.notify("Could not clear visual buffer", title="Visual Buffer", severity="warning")
-                continue
 
+    def _prime_uploaded_image(self, path: Path, source: str) -> None:
+        resolved = path.expanduser().resolve()
+        self._uploaded_image_path = resolved
+
+        VISION_BUFFER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if resolved != VISION_BUFFER_PATH:
             try:
-                await self._safe_stream_thought(response.reasoning_content or response.thought)
-                self._warn_if_repetitive_response(response.answer)
-                self._append_chat("assistant", response.answer)
-                self._track_code_block(response.answer)
-                dashboard.append_assistant(response.answer)
-            except Exception as exc:
-                dashboard.append_system(f"Auto-coach UI error: {exc}", style="red")
-            finally:
-                dashboard.set_active_tool("Idle")
+                shutil.copyfile(resolved, VISION_BUFFER_PATH)
+            except Exception:
+                pass
+
+        preview = ascii_preview_for_image(resolved)
+        self._dashboard().set_visual_buffer(f"{resolved.name} ({source})", preview)
+        self._dashboard().append_system(f"Image Uploaded: {resolved.name}", style="bold cyan")
+
+    @staticmethod
+    def _is_image_file(path: Path) -> bool:
+        return path.is_file() and path.suffix.lower() in _IMAGE_SUFFIXES
 
     def _on_web_search_state(self, active: bool) -> None:
         dashboard = self._dashboard()
@@ -364,6 +405,7 @@ class CerealKillerApp(App[None]):
         if result.new_target:
             self.current_target = result.new_target
             self._update_header_target(result.new_target)
+            dashboard.set_upload_root(Path.cwd())
             self.notify(
                 f"Context switched -> {result.new_target.upper()}",
                 title="Target Loaded",
@@ -448,7 +490,6 @@ class CerealKillerApp(App[None]):
         if callable(stream_method):
             await stream_method(thought)
             return
-        # Backward compatibility with older dashboard implementations.
         thought_box_method = getattr(dashboard, "thought_box", None)
         if callable(thought_box_method):
             thought_box = thought_box_method()
