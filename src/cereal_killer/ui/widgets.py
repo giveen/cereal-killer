@@ -58,7 +58,8 @@ class ChatMessage(Static):
         super().__init__(id=id, classes=f"chat-message chat-{role}")
         self.role = role
         self.message = self._normalize_markdown(message)
-        self._code_blocks = [block.strip() for block in CODE_BLOCK_RE.findall(self.message)]
+        self._segments = self._split_segments(self.message)
+        self._code_blocks = [chunk.strip() for kind, chunk in self._segments if kind == "code"]
         self._copy_payloads: dict[str, str] = {}
 
     def compose(self):
@@ -69,23 +70,38 @@ class ChatMessage(Static):
         }.get(self.role, self.role.title())
         yield Static(label, classes="chat-role")
 
-        markdown = Markdown("", classes="chat-markdown", open_links=False)
-        if hasattr(markdown, "code_dark_theme"):
-            markdown.code_dark_theme = "dracula"
-        if hasattr(markdown, "code_light_theme"):
-            markdown.code_light_theme = "monokai"
-        yield markdown
+        if not self._code_blocks:
+            markdown = Markdown("", classes="chat-markdown", open_links=False)
+            self._apply_code_theme(markdown)
+            yield markdown
+            return
 
-        if self._code_blocks:
-            with Vertical(classes="code-actions"):
-                for idx, code in enumerate(self._code_blocks, start=1):
-                    button_id = f"copy_block_{idx}"
-                    self._copy_payloads[button_id] = code
-                    with Horizontal(classes="code-action-row"):
-                        yield Static(f"Code Block {idx}", classes="code-action-label")
-                        yield Button("Copy", id=button_id, classes="copy-code-button")
+        code_idx = 0
+        for kind, chunk in self._segments:
+            if kind == "text":
+                if not chunk.strip():
+                    continue
+                text_md = Markdown(chunk, classes="chat-markdown", open_links=False)
+                self._apply_code_theme(text_md)
+                yield text_md
+                continue
+
+            code_idx += 1
+            code = chunk.strip()
+            if not code:
+                continue
+            button_id = f"copy_block_{code_idx}"
+            self._copy_payloads[button_id] = code
+            with Horizontal(classes="code-block-row"):
+                code_md = Markdown(f"```bash\n{code}\n```", classes="chat-code-block", open_links=False)
+                self._apply_code_theme(code_md)
+                yield code_md
+                yield Button("Copy", id=button_id, classes="copy-code-button")
 
     async def on_mount(self) -> None:
+        if self._code_blocks:
+            return
+
         markdown = self.query_one(".chat-markdown", Markdown)
         line_count = len(self.message.splitlines())
         if line_count <= self.STREAM_LINE_THRESHOLD:
@@ -139,6 +155,28 @@ class ChatMessage(Static):
         if not content:
             return "_No content._"
         return content
+
+    @staticmethod
+    def _split_segments(markdown_text: str) -> list[tuple[str, str]]:
+        segments: list[tuple[str, str]] = []
+        last = 0
+        for match in CODE_BLOCK_RE.finditer(markdown_text):
+            if match.start() > last:
+                segments.append(("text", markdown_text[last:match.start()]))
+            segments.append(("code", match.group(1)))
+            last = match.end()
+        if last < len(markdown_text):
+            segments.append(("text", markdown_text[last:]))
+        if not segments:
+            segments.append(("text", markdown_text))
+        return segments
+
+    @staticmethod
+    def _apply_code_theme(markdown_widget: Markdown) -> None:
+        if hasattr(markdown_widget, "code_dark_theme"):
+            markdown_widget.code_dark_theme = "dracula"
+        if hasattr(markdown_widget, "code_light_theme"):
+            markdown_widget.code_light_theme = "monokai"
 
 
 class ThoughtBox(Collapsible):

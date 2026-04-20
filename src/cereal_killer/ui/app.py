@@ -489,8 +489,9 @@ class CerealKillerApp(App[None]):
 
     async def _apply_command_result(self, result: CommandResult) -> None:
         dashboard = self._dashboard()
-        dashboard.append_system(result.message, style="cyan")
-        self._append_chat("assistant", result.message)
+        cleaned_message = self._strip_rich_tags(result.message)
+        dashboard.append_system(cleaned_message, style="cyan")
+        self._append_chat("assistant", cleaned_message)
 
         if result.system_prompt_addendum is not None:
             self.engine.set_system_prompt_addendum(result.system_prompt_addendum)

@@ -141,6 +141,18 @@ Screen {
     border: round #5376ad;
 }
 
+.code-block-row {
+    height: auto;
+    layout: horizontal;
+    align: left top;
+    margin-bottom: 1;
+}
+
+.chat-code-block {
+    width: 1fr;
+    margin-right: 1;
+}
+
 #response_title {
     height: auto;
     color: #9cffc8;
