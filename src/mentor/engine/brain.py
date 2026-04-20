@@ -434,7 +434,20 @@ class Brain:
                 return content, reasoning_content, metrics
 
         if self._client is None:
-            raise RuntimeError("No LLM client available. Install openai or enable LiteLLM with USE_LITELLM=1.")
+            self._backend_trace(
+                event="error",
+                trace_id=trace_id,
+                provider="openai-client",
+                machine=machine_name,
+                payload={
+                    "error": "No LLM client available",
+                    "hint": "Install openai in the active environment or set USE_LITELLM=1",
+                },
+            )
+            raise RuntimeError(
+                "No LLM client available. Install openai in this environment "
+                "or enable LiteLLM with USE_LITELLM=1."
+            )
 
         request_payload = {
             "model": self.settings.llm_model,

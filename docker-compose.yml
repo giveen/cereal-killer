@@ -17,12 +17,15 @@ services:
       LLM_MODEL: ${LLM_MODEL:-qwen3.6}
       LLM_API_KEY: ${LLM_API_KEY:-not-needed}
       REASONING_PARSER: ${REASONING_PARSER:-qwen3}
+      BACKEND_TRACE_ENABLED: ${BACKEND_TRACE_ENABLED:-1}
+      BACKEND_TRACE_PATH: ${BACKEND_TRACE_PATH:-/app/logs/llm_backend.log}
       MAX_MODEL_LEN: ${MAX_MODEL_LEN:-262144}
       SEARXNG_BASE_URL: ${SEARXNG_BASE_URL:-http://searxng:8080}
       HISTORY_PATH: ${HISTORY_PATH:-/home/jabbatheduck/.zsh_history}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
+      - ./logs:/app/logs
       - ~/.zsh_history:/home/appuser/.zsh_history:ro
       - ~/.bash_history:/home/appuser/.bash_history:ro
       - ~/.local/share/fish/fish_history:/home/appuser/.local/share/fish/fish_history:ro
