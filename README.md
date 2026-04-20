@@ -156,6 +156,7 @@ Use environment variables (from `.env` in Docker or your shell locally):
 - `BACKEND_TRACE_ENABLED` (default `1`)
 - `BACKEND_TRACE_PATH` (default `logs/llm_backend.log`)
 - `BACKEND_TRACE_MAX_CHARS` (default `8000`)
+- `GIBSON_SKIP_ENV_CHECK` (default `0`) — set `1` to bypass local setup validation when running against remote infra
 
 Docker compose also sets:
 

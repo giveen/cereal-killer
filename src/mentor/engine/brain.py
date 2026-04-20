@@ -257,6 +257,7 @@ class Brain:
                 if include_thinking_buffer
                 else ""
             )
+            +
             f"Runtime coaching directives:\n{dynamic_runtime_hint or '- none'}\n\n"
             f"Latest Command/Input:\n{latest_input or '- none'}\n\n"
             f"Historical Commands:\n{context_block or '- none'}\n\n"

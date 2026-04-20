@@ -18,9 +18,11 @@ setup:
 	@echo "Generating local setup config..."
 	python scripts/setup/generate_config.py
 	@echo "Running Gibson setup checks..."
+	set -a; [ -f .env ] && . ./.env; set +a; \
 	bash ./scripts/setup/gibson_check.sh
 
 check:
+	set -a; [ -f .env ] && . ./.env; set +a; \
 	bash ./scripts/setup/gibson_check.sh
 
 check-env:
