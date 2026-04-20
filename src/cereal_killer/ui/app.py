@@ -54,6 +54,7 @@ class CerealKillerApp(App[None]):
         ("ctrl+c", "quit", "Quit"),
         ("ctrl+b", "pulse_easy_button", "Easy Button"),
         ("u", "toggle_upload_tree", "Toggle Upload Tree"),
+        ("ctrl+o", "show_ops_view", "Ops View"),
     ]
 
     def __init__(self, engine: LLMEngine, kb: KnowledgeBase) -> None:
@@ -85,6 +86,7 @@ class CerealKillerApp(App[None]):
     async def on_mount(self) -> None:
         await self.push_screen(MainDashboard())
         dashboard = self._dashboard()
+        dashboard.set_active_view("chat")
         dashboard.apply_responsive_layout(self.size.width)
         dashboard.set_phase("[IDLE]")
         dashboard.set_upload_root(Path.cwd())
@@ -141,6 +143,9 @@ class CerealKillerApp(App[None]):
 
     def action_toggle_upload_tree(self) -> None:
         self._dashboard().toggle_upload_tree()
+
+    def action_show_ops_view(self) -> None:
+        self._dashboard().set_active_view("ops")
 
     async def _handle_command(self, prompt: str) -> None:
         dashboard = self._dashboard()
@@ -326,13 +331,19 @@ class CerealKillerApp(App[None]):
         dashboard = self._dashboard()
         if not hasattr(self.engine, "settings"):
             return
+        lines: list[str] = []
         async for result in run_boot_sequence(self.engine.settings):
-            dashboard.append_system(result.message, style="dim")
+            lines.append(self._strip_rich_tags(result.message))
             await asyncio.sleep(0)
+        dashboard.set_boot_status("\n".join(line for line in lines if line.strip()))
         greeting = await self.engine.returning_greeting()
         if greeting:
             dashboard.append_assistant(greeting)
             self._append_chat("assistant", greeting)
+
+    @staticmethod
+    def _strip_rich_tags(text: str) -> str:
+        return re.sub(r"\[/?[^\]]+\]", "", text or "")
 
     async def _observe(self) -> None:
         cwd = str(Path.cwd())

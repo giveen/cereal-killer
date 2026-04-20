@@ -10,6 +10,17 @@ Screen {
     layout: vertical;
 }
 
+#view_tabs {
+    height: auto;
+    margin-bottom: 1;
+    layout: horizontal;
+}
+
+#tab_chat,
+#tab_ops {
+    margin-right: 1;
+}
+
 #main_row {
     height: 1fr;
     layout: horizontal;
@@ -51,6 +62,16 @@ Screen {
     color: #bcffd8;
     padding: 1;
     overflow-y: auto;
+}
+
+#boot_status_box {
+    height: auto;
+    margin-bottom: 1;
+    border: tall #3d5a7a;
+    background: #0b1320;
+    color: #d4e7ff;
+    padding: 1;
+    display: none;
 }
 
 .chat-message {
@@ -310,200 +331,4 @@ Screen {
 
 .hidden {
     display: none;
-}
-
-/* ====== RESPONSIVE BREAKPOINTS ====== */
-
-/* VERY SMALL: < 100 chars — Chat only, no sidebars */
-@media (max-width: 100) {
-    #dashboard {
-        padding: 0;
-    }
-    
-    #main_row {
-        layout: vertical;
-    }
-    
-    #explorer_pane {
-        display: none;
-    }
-    
-    #left_pane {
-        margin-right: 0;
-        padding: 0;
-        border: none;
-    }
-    
-    #chat_log {
-        padding: 0;
-        border: none;
-    }
-    
-    #response_title {
-        display: none;
-    }
-    
-    #response_actions {
-        display: none;
-    }
-    
-    #intel_sidebar {
-        display: none;
-    }
-    
-    #easy_button {
-        display: none;
-    }
-}
-
-/* SMALL: 100-140 chars — Chat + sidebar stacked vertically */
-@media (min-width: 100) and (max-width: 140) {
-    #main_row {
-        layout: vertical;
-    }
-    
-    #explorer_pane {
-        display: none;
-    }
-    
-    #left_pane {
-        height: 2fr;
-        margin-right: 0;
-    }
-    
-    #intel_sidebar {
-        height: 1fr;
-        border: tall #ff3d3d;
-        margin-top: 1;
-        padding: 1;
-    }
-    
-    #response_title {
-        display: none;
-    }
-    
-    #response_markdown {
-        display: none;
-    }
-    
-    #response_actions {
-        display: none;
-    }
-    
-    #easy_button {
-        display: none;
-    }
-}
-
-/* MEDIUM: 140-180 chars — Chat + sidebar side-by-side, no explorer */
-@media (min-width: 140) and (max-width: 180) {
-    #main_row {
-        layout: horizontal;
-    }
-    
-    #explorer_pane {
-        display: none;
-    }
-    
-    #left_pane {
-        width: 2fr;
-        height: 1fr;
-    }
-    
-    #intel_sidebar {
-        width: 1fr;
-        height: 1fr;
-    }
-    
-    #response_title {
-        display: none;
-    }
-    
-    #response_markdown {
-        display: none;
-    }
-    
-    #response_actions {
-        display: none;
-    }
-    
-    #easy_button {
-        display: none;
-    }
-}
-
-/* LARGE: 180-220 chars — Full layout with explorer, chat, sidebar */
-@media (min-width: 180) and (max-width: 220) {
-    #main_row {
-        layout: horizontal;
-    }
-    
-    #explorer_pane {
-        width: 25;
-        display: block;
-    }
-    
-    #left_pane {
-        width: 2fr;
-        height: 1fr;
-    }
-    
-    #intel_sidebar {
-        width: 1fr;
-        height: 1fr;
-    }
-    
-    #response_title {
-        display: none;
-    }
-    
-    #response_markdown {
-        display: none;
-    }
-    
-    #response_actions {
-        display: none;
-    }
-    
-    #easy_button {
-        display: none;
-    }
-}
-
-/* EXTRA LARGE: 220+ chars — Full 3-pane with response panel and buttons */
-@media (min-width: 220) {
-    #main_row {
-        layout: horizontal;
-    }
-    
-    #explorer_pane {
-        width: 25;
-        display: block;
-    }
-    
-    #left_pane {
-        width: 2fr;
-        height: 1fr;
-    }
-    
-    #chat_log {
-        height: 2fr;
-    }
-    
-    #response_markdown {
-        display: block;
-    }
-    
-    #response_actions {
-        display: block;
-    }
-    
-    #intel_sidebar {
-        width: 1fr;
-        height: 1fr;
-    }
-    
-    #easy_button {
-        display: block;
-    }
 }

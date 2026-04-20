@@ -89,15 +89,20 @@ class MainDashboard(Screen[None]):
         super().__init__()
         self._last_response_raw = ""
         self._last_response_markdown = ""
+        self._active_view = "chat"
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dashboard"):
+            with Horizontal(id="view_tabs"):
+                yield Button("Chat", id="tab_chat", variant="primary")
+                yield Button("Ops", id="tab_ops", variant="default")
             with Horizontal(id="main_row"):
                 with Vertical(id="explorer_pane"):
                     with Collapsible(title="📸 Screenshots", collapsed=False, id="upload_collapsible"):
                         screenshots_dir = Path("/screenshots") if Path("/screenshots").exists() else Path.cwd()
                         yield DirectoryTree(str(screenshots_dir), id="upload_tree")
                 with Vertical(id="left_pane"):
+                    yield Static("", id="boot_status_box")
                     yield VerticalScroll(id="chat_log")
                     yield Static("LATEST RESPONSE", id="response_title")
                     yield Markdown("_No response yet._", id="response_markdown", open_links=False)
@@ -184,9 +189,54 @@ class MainDashboard(Screen[None]):
         await sidebar.pulse_terminal_link()
 
     def apply_responsive_layout(self, width: int) -> None:
-        """Responsive layout is now handled by media queries in CSS.
-        This method is kept for compatibility."""
-        pass
+        explorer = self.query_one("#explorer_pane", Vertical)
+        left_pane = self.query_one("#left_pane", Vertical)
+        sidebar = self.query_one("#intel_sidebar", SidebarStatus)
+        response_title = self.query_one("#response_title", Static)
+        response_markdown = self.query_one("#response_markdown", Markdown)
+        response_actions = self.query_one("#response_actions", Horizontal)
+        easy_button = self.query_one("#easy_button", Button)
+
+        # Base layout for medium and larger terminals.
+        explorer.styles.display = "block"
+        left_pane.styles.width = "2fr"
+        left_pane.styles.margin_right = 1
+        sidebar.styles.display = "block"
+        response_title.styles.display = "block"
+        response_markdown.styles.display = "block"
+        response_actions.styles.display = "block"
+        easy_button.styles.display = "block"
+
+        if width < 100:
+            explorer.styles.display = "none"
+            sidebar.styles.display = "none"
+            response_title.styles.display = "none"
+            response_markdown.styles.display = "none"
+            response_actions.styles.display = "none"
+            easy_button.styles.display = "none"
+            left_pane.styles.width = "1fr"
+            left_pane.styles.margin_right = 0
+            self.set_active_view("chat")
+            return
+
+        if width < 180:
+            explorer.styles.display = "none"
+            response_title.styles.display = "none"
+            response_markdown.styles.display = "none"
+            response_actions.styles.display = "none"
+            easy_button.styles.display = "none"
+            left_pane.styles.width = "2fr"
+            self.set_active_view("chat")
+            return
+
+        if width < 220:
+            response_title.styles.display = "none"
+            response_markdown.styles.display = "none"
+            response_actions.styles.display = "none"
+            easy_button.styles.display = "none"
+
+        # Preserve explicit tab selection for larger layouts.
+        self.set_active_view(self._active_view)
 
     def toggle_upload_tree(self) -> None:
         """Toggle the explorer pane visibility (U shortcut)."""
@@ -196,6 +246,14 @@ class MainDashboard(Screen[None]):
             explorer.styles.display = "block"
         else:
             explorer.styles.display = "none"
+
+    @on(Button.Pressed, "#tab_chat")
+    def show_chat_view(self) -> None:
+        self.set_active_view("chat")
+
+    @on(Button.Pressed, "#tab_ops")
+    def show_ops_view(self) -> None:
+        self.set_active_view("ops")
 
     def set_upload_root(self, root_path: Path) -> None:
         tree = self.query_one("#upload_tree", DirectoryTree)
@@ -207,6 +265,37 @@ class MainDashboard(Screen[None]):
     def set_loading(self, active: bool) -> None:
         indicator = self.query_one("#analysis_loading", LoadingIndicator)
         indicator.display = active
+
+    def set_boot_status(self, text: str) -> None:
+        box = self.query_one("#boot_status_box", Static)
+        body = (text or "").strip()
+        if body:
+            box.update(body)
+            box.styles.display = "block"
+        else:
+            box.update("")
+            box.styles.display = "none"
+
+    def set_active_view(self, view: str) -> None:
+        explorer = self.query_one("#explorer_pane", Vertical)
+        left_pane = self.query_one("#left_pane", Vertical)
+        sidebar = self.query_one("#intel_sidebar", SidebarStatus)
+        tab_chat = self.query_one("#tab_chat", Button)
+        tab_ops = self.query_one("#tab_ops", Button)
+
+        self._active_view = "ops" if view == "ops" else "chat"
+        if self._active_view == "ops":
+            explorer.styles.display = "none"
+            left_pane.styles.display = "none"
+            sidebar.styles.display = "block"
+            tab_chat.variant = "default"
+            tab_ops.variant = "primary"
+        else:
+            explorer.styles.display = "block"
+            left_pane.styles.display = "block"
+            sidebar.styles.display = "none"
+            tab_chat.variant = "primary"
+            tab_ops.variant = "default"
 
     def _update_response_markdown(self, text: str) -> None:
         self._last_response_raw = text or ""

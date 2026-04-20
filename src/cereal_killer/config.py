@@ -2,6 +2,28 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
+
+
+def _load_dotenv() -> None:
+    """Best-effort .env loader for local runs that bypass Makefile exports."""
+    candidates = [Path.cwd() / ".env", Path(__file__).resolve().parents[2] / ".env"]
+    dotenv_path = next((path for path in candidates if path.exists()), None)
+    if dotenv_path is None:
+        return
+
+    for raw in dotenv_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv()
 
 
 @dataclass(slots=True)
@@ -10,7 +32,7 @@ class Settings:
     redis_index: str = os.getenv("REDIS_INDEX", "ippsec_idx")
     llm_base_url: str = os.getenv("LLM_BASE_URL", "http://host.docker.internal:8000/v1")
     # Dedicated multimodal endpoint (llama-swap / OpenAI-compatible).
-    llm_vision_base_url: str = os.getenv("LLM_VISION_BASE_URL", "http://localhost:8000/v1")
+    llm_vision_base_url: str = os.getenv("LLM_VISION_BASE_URL", "")
     llm_api_key: str = os.getenv("LLM_API_KEY", "not-needed")
     llm_model: str = os.getenv("LLM_MODEL", "qwen3.6")
     llm_vision_model: str = os.getenv("LLM_VISION_MODEL", "")

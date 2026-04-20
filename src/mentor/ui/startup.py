@@ -88,7 +88,7 @@ async def _check_llm_endpoint(settings: Settings) -> CheckResult:
                 "skipping pre-flight check. Hope you know what you're doing."
             ),
         )
-    base_url = (settings.llm_vision_base_url or settings.llm_base_url).rstrip("/")
+    base_url = settings.llm_base_url.rstrip("/")
     url = base_url + "/models"
     try:
         async with httpx.AsyncClient(timeout=4.0) as client:
@@ -124,21 +124,21 @@ async def _check_llm_endpoint(settings: Settings) -> CheckResult:
                     label="LLM",
                     ok=False,
                     message=(
-                        "[yellow][WARN][/yellow] [b]llama-swap[/b] — reachable, but no vision model looks active. "
-                        "I'm currently blind. Go to llama-swap and load the vision projector if you want me to look at that."
+                        "[yellow][WARN][/yellow] [b]LLM[/b] — endpoint reachable, but no vision model looks active. "
+                        "Text coaching should work; screenshot analysis may be limited."
                     ),
                 )
 
             return CheckResult(
                 label="LLM",
                 ok=True,
-                message="[green][ OK ][/green] [b]llama-swap[/b] — vision model online and ready.",
+                message="[green][ OK ][/green] [b]LLM[/b] — model endpoint online and ready.",
             )
         return CheckResult(
             label="LLM",
             ok=False,
             message=(
-                f"[red][FAIL][/red] [b]llama-swap[/b] — HTTP {resp.status_code}. "
+                f"[red][FAIL][/red] [b]LLM[/b] — HTTP {resp.status_code} from {base_url}. "
                 "Is /v1/models reachable and does it have an active model?"
             ),
         )
@@ -147,7 +147,7 @@ async def _check_llm_endpoint(settings: Settings) -> CheckResult:
             label="LLM",
             ok=False,
             message=(
-                f"[red][FAIL][/red] [b]llama-swap[/b] — can't reach {base_url}. "
+                f"[red][FAIL][/red] [b]LLM[/b] — can't reach {base_url}. "
                 f"No LLM, no coaching, just vibes. ({exc})"
             ),
         )

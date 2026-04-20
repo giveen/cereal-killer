@@ -64,6 +64,13 @@ _SNARK_ADDENDA: dict[int, str] = {
     10: "TONE: Abusive and brutal; tear into every mistake. Technically correct but caustic.",
 }
 
+# Injected into system prompt when live web results are used.
+_WEB_SEARCH_ADDENDUM = (
+    "You had to consult the live web for this response because local notes were insufficient. "
+    "Begin your reply with a brief sarcastic acknowledgement of that fact and cite used URLs from Live Web Results. "
+    "Do not invent URLs or fabricate citations."
+)
+
 
 @dataclass
 class BrainResponse:
@@ -74,6 +81,26 @@ class BrainResponse:
 
 
 class Brain:
+    COMMAND_CONTEXT_LIMIT = 20
+    STUCK_TURN_LIMIT = 5
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.system_prompt = OLDER_ZERO_COOL_PROMPT
+        # Optional block injected by /box or /new-box; prepended to system prompt.
+        self.system_prompt_addendum: str = ""
+        # Callback invoked with True when a web search fires, False when it completes.
+        self.on_web_search_state_change: Callable[[bool], None] | None = None
+        self._pedagogy = PedagogyEngine()
+        self._session = ThinkingSessionStore(settings)
+        self._stalled_turns = 0
+        self._last_progress_signature = ""
+        self._recent_user_inputs: list[str] = []
+        self._last_user_input = ""
+        self._client: Any | None = None
+        if AsyncOpenAI is not None:
+            self._client = AsyncOpenAI(base_url=settings.llm_base_url, api_key=settings.llm_api_key)
+
     async def persist_mental_state(self, history_commands: list[str] | None = None) -> None:
         machine_name = Path.cwd().name
         thinking_chain = await self._session.thinking_buffer(machine_name)
