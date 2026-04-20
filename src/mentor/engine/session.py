@@ -250,10 +250,10 @@ class ThinkingSessionStore:
             "reasoning_parser": self.settings.reasoning_parser,
             "cache_prompt": True,
             "chat_template_kwargs": {
-                "preserve_thinking": True,
+                "preserve_thinking": self.settings.preserve_thinking,
             },
             "metadata": {
-                "preserve_thinking": True,
+                "preserve_thinking": self.settings.preserve_thinking,
                 "max_model_len": self.settings.max_model_len,
             },
         }

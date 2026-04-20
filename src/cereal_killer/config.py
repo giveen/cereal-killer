@@ -38,6 +38,13 @@ class Settings:
     llm_vision_model: str = os.getenv("LLM_VISION_MODEL", "")
     github_token: str = os.getenv("GITHUB_TOKEN", "")
     reasoning_parser: str = os.getenv("REASONING_PARSER", "qwen3")
+    # Disable backend thought preservation by default to avoid leaking internal context.
+    preserve_thinking: bool = os.getenv("PRESERVE_THINKING", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     max_model_len: int = int(os.getenv("MAX_MODEL_LEN", "262144"))
     # SearXNG last-resort web search.  Empty string disables the feature.
     searxng_base_url: str = os.getenv("SEARXNG_BASE_URL", "http://localhost:18080")

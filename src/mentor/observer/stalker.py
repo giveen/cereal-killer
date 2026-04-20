@@ -379,16 +379,43 @@ def _check_history_path_readable(path: Path) -> tuple[bool, str]:
     return True, ""
 
 
+def _resolve_history_path() -> Path:
+    """Resolve history file path from env override or machine-local defaults."""
+    history_path_override = os.environ.get("HISTORY_PATH", "").strip()
+    if history_path_override:
+        override = Path(history_path_override).expanduser()
+        is_readable, _ = _check_history_path_readable(override)
+        if is_readable:
+            return override
+
+    candidates = candidate_history_files()
+    for candidate in candidates:
+        is_readable, _ = _check_history_path_readable(candidate)
+        if is_readable:
+            return candidate
+
+    # Last-resort fallback: prefer bash history on unknown shells.
+    return Path.home() / ".bash_history"
+
+
 async def observe_history(cwd: str) -> AsyncIterator[HistoryEvent]:
     if awatch is None or Change is None:
         raise RuntimeError("watchfiles is required for asynchronous history stalking.")
 
-    # Get history path from environment or use default
-    history_path_str = os.environ.get("HISTORY_PATH", "/home/jabbatheduck/.zsh_history")
-    history_path = Path(history_path_str).expanduser()
+    history_path = _resolve_history_path()
     
-    # Check if history path is readable and raise visible error if not
+    # Check if history path is readable and try one more fallback before erroring.
     is_readable, error_msg = _check_history_path_readable(history_path)
+    if not is_readable:
+        for candidate in candidate_history_files():
+            if candidate == history_path:
+                continue
+            candidate_ok, _ = _check_history_path_readable(candidate)
+            if candidate_ok:
+                history_path = candidate
+                is_readable = True
+                break
+
     if not is_readable:
         raise RuntimeError(error_msg)
     

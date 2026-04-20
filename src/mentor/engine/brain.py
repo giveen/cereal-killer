@@ -170,7 +170,7 @@ class Brain:
         context_block = "\n".join(f"- {cmd}" for cmd in historical_commands)
         minified_tool_output = minify_terminal_output(tool_output or "", command=tool_command)
         previous_reasoning = await self._session.thinking_buffer(machine_name)
-        include_thinking_buffer = self._should_include_thinking_buffer(user_prompt)
+        include_thinking_buffer = self.settings.preserve_thinking and self._should_include_thinking_buffer(user_prompt)
 
         thinking_flush = bool(re.search(r"\bwhat\s+am\s+i\s+doing\s+wrong\b", user_prompt, re.IGNORECASE))
         if thinking_flush:
@@ -269,8 +269,6 @@ class Brain:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": pinned_system_prompt},
         ]
-        if include_thinking_buffer and previous_reasoning:
-            messages.append({"role": "assistant", "content": "", "reasoning_content": previous_reasoning})
         messages.append({"role": "user", "content": user_message})
 
         messages = self._dedupe_messages(messages)
@@ -280,7 +278,7 @@ class Brain:
             messages=messages,
         )
         parsed = parse_brain_output(content)
-        persisted_reasoning = reasoning_content.strip() or parsed.thought
+        persisted_reasoning = parsed.thought.strip()
         if persisted_reasoning:
             await self._session.append_thought(machine_name, persisted_reasoning)
         self._last_user_input = latest_input
@@ -333,7 +331,7 @@ class Brain:
         raw_machine_name = Path.cwd().name
         machine_name = self._session_machine_name(raw_machine_name)
         previous_reasoning = await self._session.thinking_buffer(machine_name)
-        include_thinking_buffer = self._should_include_thinking_buffer(user_prompt)
+        include_thinking_buffer = self.settings.preserve_thinking and self._should_include_thinking_buffer(user_prompt)
         reference_snippets = retrieve_reference_material(
             self.settings,
             command_or_prompt=user_prompt,
@@ -354,10 +352,9 @@ class Brain:
                 if include_thinking_buffer
                 else "Thinking buffer omitted to preserve context budget."
             ),
-            previous_reasoning=previous_reasoning if include_thinking_buffer else "",
         )
         parsed = parse_brain_output(content)
-        persisted_reasoning = reasoning_content.strip() or parsed.thought
+        persisted_reasoning = parsed.thought.strip()
         if persisted_reasoning:
             await self._session.append_thought(machine_name, persisted_reasoning)
         return BrainResponse(
@@ -494,7 +491,6 @@ class Brain:
         system_prompt: str,
         machine_name: str,
         context_text: str,
-        previous_reasoning: str,
     ) -> tuple[str, str, dict[str, Any]]:
         image_data_uri = self._file_to_data_uri(image_path)
         extra_body = self._session.reasoning_payload()
@@ -517,8 +513,6 @@ class Brain:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
         ]
-        if previous_reasoning:
-            messages.append({"role": "assistant", "content": "", "reasoning_content": previous_reasoning})
         messages.append(
             {
                 "role": "user",

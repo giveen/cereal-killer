@@ -148,6 +148,7 @@ Use environment variables (from `.env` in Docker or your shell locally):
 - `LLM_VISION_BASE_URL` (default `http://localhost:8000/v1`)
 - `LLM_VISION_MODEL` (default empty, falls back to normal model path)
 - `REASONING_PARSER` (default `qwen3`)
+- `PRESERVE_THINKING` (default `0`) — when `1`, allows reasoning passthrough for compatible backends
 - `MAX_MODEL_LEN` (default `262144`)
 - `SEARXNG_BASE_URL` (default `http://localhost:18080`)
 - `SEARXNG_VECTOR_THRESHOLD` (default `0.7`)
@@ -156,6 +157,7 @@ Use environment variables (from `.env` in Docker or your shell locally):
 - `BACKEND_TRACE_ENABLED` (default `1`)
 - `BACKEND_TRACE_PATH` (default `logs/llm_backend.log`)
 - `BACKEND_TRACE_MAX_CHARS` (default `8000`)
+- `HISTORY_PATH` (default auto-detect; fallback `~/.bash_history`) — shell history file watched by Terminal Link
 - `GIBSON_SKIP_ENV_CHECK` (default `0`) — set `1` to bypass local setup validation when running against remote infra
 
 Docker compose also sets:
