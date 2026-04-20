@@ -1,6 +1,6 @@
-.PHONY: docker-build docker-up docker-up-init docker-down tui run start sync-ippsec sync-all
+.PHONY: docker-build docker-up docker-up-init docker-down tui run start sync-ippsec sync-all setup check check-env
 
-.DEFAULT_GOAL := tui
+.DEFAULT_GOAL := run
 
 DOCKER_BUILDKIT ?= 1
 COMPOSE_DOCKER_CLI_BUILD ?= 1
@@ -12,7 +12,19 @@ docker-build:
 	docker compose build
 
 docker-up:
-	docker compose up -d --build redis searxng
+	docker compose up -d
+
+setup:
+	@echo "Generating local setup config..."
+	python scripts/setup/generate_config.py
+	@echo "Running Gibson setup checks..."
+	bash ./scripts/setup/gibson_check.sh
+
+check:
+	bash ./scripts/setup/gibson_check.sh
+
+check-env:
+	$(MAKE) check
 
 docker-up-init: docker-up
 	@echo "Running full knowledge sync (IppSec + configured sources)..."
@@ -36,7 +48,7 @@ tui:
 		docker compose run --rm --build app cereal-killer; \
 	fi
 
-run: tui
+run: check tui
 
 start: tui
 

@@ -39,7 +39,8 @@ from mentor.kb.query import retrieve_solution_for_machine
 from mentor.ui.phase import detect_phase
 from mentor.ui.startup import run_boot_sequence
 
-from .screens import IngestModal, IngestSelection, MainDashboard, SolutionModal
+from .screens import InfrastructureCriticalModal, IngestModal, IngestSelection, MainDashboard, SolutionModal
+from .tabs.ops import check_system_readiness
 from .widgets import PulsingEasyButton
 
 
@@ -67,7 +68,13 @@ class CerealKillerApp(App[None]):
         ("ctrl+u", "open_upload_modal", "Upload"),
     ]
 
-    def __init__(self, engine: LLMEngine, kb: KnowledgeBase) -> None:
+    def __init__(
+        self,
+        engine: LLMEngine,
+        kb: KnowledgeBase,
+        preflight_hard_fail: bool = False,
+        preflight_reason: str = "",
+    ) -> None:
         super().__init__()
         self.engine = engine
         self.kb = kb
@@ -88,6 +95,8 @@ class CerealKillerApp(App[None]):
         self._uploaded_image_path: Path | None = None
         self._gibson_snippets: list[dict] = []
         self._vision_analyzed_sources: set[str] = set()
+        self._preflight_hard_fail = preflight_hard_fail
+        self._preflight_reason = preflight_reason
 
     def _dashboard(self) -> MainDashboard:
         screen = self.screen
@@ -114,6 +123,10 @@ class CerealKillerApp(App[None]):
         asyncio.create_task(self._run_boot_sequence())
         self._refresh_knowledge_sync_status()
         self._refresh_github_api_status()
+        asyncio.create_task(self._run_system_readiness_check())
+        if self._preflight_hard_fail:
+            dashboard.set_active_view("ops")
+            self.push_screen(InfrastructureCriticalModal(self._preflight_reason))
         if hasattr(self.engine, "set_web_search_callback"):
             self.engine.set_web_search_callback(self._on_web_search_state)
 
@@ -191,6 +204,23 @@ class CerealKillerApp(App[None]):
         dashboard = self._dashboard()
         dashboard.set_active_view("gibson")
         dashboard.focus_gibson_input()
+
+    @on(Button.Pressed, "#system_readiness_tag")
+    def on_system_readiness_tag_pressed(self) -> None:
+        dashboard = self._dashboard()
+        guide = Path("docs/setup/README.md")
+        if not guide.exists():
+            self.notify("Setup guide not found at docs/setup/README.md", title="Setup", severity="warning")
+            return
+
+        dashboard.set_active_view("gibson")
+        try:
+            markdown = guide.read_text(encoding="utf-8")
+        except Exception as exc:
+            self.notify(f"Could not open setup guide: {exc}", title="Setup", severity="warning")
+            return
+        dashboard.query_one("#gibson_viewer", Markdown).update(markdown)
+        self.notify("Opened setup guide in Gibson tab", title="Setup", severity="information")
 
     def queue_remote_visual_url(self, url: str) -> None:
         """Handle inline Gibson [VIEW IMAGE] links."""
@@ -897,6 +927,18 @@ class CerealKillerApp(App[None]):
             return
         reset_in = max(0, int((snapshot.reset_epoch - int(_time.time())) / 60))
         dashboard.set_github_api_status(f"{snapshot.remaining}/{snapshot.limit} (Resets in {reset_in}m)")
+
+    async def _run_system_readiness_check(self) -> None:
+        dashboard = self._try_dashboard()
+        if dashboard is None:
+            return
+
+        result = await check_system_readiness(self.kb.settings.llm_base_url)
+        if result.ok:
+            dashboard.set_system_readiness(True)
+            return
+
+        dashboard.set_system_readiness(False, result.details)
 
     @work(exclusive=False, thread=False, group="cve-jit")
     async def _run_cve_jit_worker(self, text: str) -> None:

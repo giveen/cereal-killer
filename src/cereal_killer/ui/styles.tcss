@@ -69,10 +69,10 @@ Screen {
 }
 
 #explorer_pane {
-    width: 22;
+    width: 12;
     height: 1fr;
     background: #050a12;
-    padding: 1;
+    padding: 0 1;
     margin-right: 1;
     border: none;
 }
@@ -80,14 +80,16 @@ Screen {
 #ingest_icon_row {
     height: auto;
     layout: vertical;
+    align: center top;
     margin-bottom: 1;
     border: none;
 }
 
 #open_image_ingest,
 #open_document_ingest {
-    width: 1fr;
-    margin-bottom: 1;
+    width: 4;
+    height: 2;
+    margin-bottom: 0;
     color: #00ffd5;
     background: #05121f;
     border: none;
@@ -294,6 +296,21 @@ Screen {
 .ops-stat {
     color: #d7f0ff;
     text-style: bold;
+}
+
+#system_readiness_tag {
+    width: auto;
+    min-width: 26;
+    height: auto;
+    padding: 0 1;
+    background: #08101a;
+    color: #d7f0ff;
+    border: none;
+}
+
+#system_readiness_tag:disabled {
+    background: #08101a;
+    color: #7ef5c9;
 }
 
 .ops-sep {

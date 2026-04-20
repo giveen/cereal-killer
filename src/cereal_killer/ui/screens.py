@@ -86,6 +86,25 @@ class SolutionModal(ModalScreen[None]):
         self.dismiss(None)
 
 
+class InfrastructureCriticalModal(ModalScreen[None]):
+    def __init__(self, detail: str = "") -> None:
+        super().__init__()
+        self.detail = detail
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="solution_shell"):
+            yield Static("SYSTEM CRITICAL: INFRASTRUCTURE OFFLINE. SEE DOCS/SETUP.", id="decryption_text")
+            msg = "Fix setup blockers before running workflows."
+            if self.detail:
+                msg += f"\n\nDetected hard failures: {self.detail}"
+            yield Markdown(msg, id="solution_markdown", open_links=False)
+            yield Button("Acknowledge", id="solution_close", variant="primary")
+
+    @on(Button.Pressed, "#solution_close")
+    def close_modal(self) -> None:
+        self.dismiss(None)
+
+
 @dataclass(slots=True)
 class IngestSelection:
     path: Path
@@ -313,6 +332,10 @@ class MainDashboard(Screen[None]):
     def set_github_api_status(self, summary: str) -> None:
         sidebar = self.query_one("#intel_sidebar", SidebarStatus)
         sidebar.set_github_api_status(summary)
+
+    def set_system_readiness(self, ok: bool, details: str = "") -> None:
+        sidebar = self.query_one("#intel_sidebar", SidebarStatus)
+        sidebar.set_system_readiness(ok, details)
 
     async def pulse_terminal_link(self) -> None:
         """Pulse the terminal link indicator to show data is flowing."""

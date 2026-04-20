@@ -320,6 +320,8 @@ class SidebarStatus(Vertical):
             yield Static("PHASE: [IDLE]", id="current_phase", classes="ops-stat")
             yield Static("|", classes="ops-sep")
             yield Static("TOOL: Idle", id="active_tool", classes="ops-stat")
+            yield Static("|", classes="ops-sep")
+            yield Button("SETUP: CHECKING", id="system_readiness_tag", variant="default")
         with Horizontal(id="ops_bottom_row"):
             yield Static("", id="ops_spacer")
             with Vertical(id="ops_media_column"):
@@ -387,6 +389,24 @@ class SidebarStatus(Vertical):
         self.query_one("#system_health_status", Static).update(
             "[dim]SYSTEM HEALTH[/dim]\n"
             f"GITHUB API: {line}"
+        )
+
+    def set_system_readiness(self, ok: bool, details: str = "") -> None:
+        status = self.query_one("#system_readiness_tag", Button)
+        if ok:
+            status.label = "SETUP: ✓ READY"
+            status.disabled = True
+            return
+
+        status.label = "SETUP: ⚠ SETUP INCOMPLETE"
+        status.disabled = False
+
+        extra = f" ({details})" if details else ""
+        self.query_one("#system_health_status", Static).update(
+            "[dim]SYSTEM HEALTH[/dim]\n"
+            f"GITHUB API: unknown\n"
+            f"Setup missing{extra}\n"
+            "Guide: docs/setup/README.md"
         )
 
     def set_visual_buffer_image(self, image_path: Path, *, source: str, preview: str = "") -> None:
