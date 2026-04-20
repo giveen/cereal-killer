@@ -73,6 +73,9 @@ class SidebarStatus(Vertical):
     def compose(self):
         yield Static("CURRENT PHASE\n[IDLE]", id="current_phase")
         yield Static("ACTIVE TOOL\nIdle", id="active_tool")
+        yield Static("VISUAL BUFFER", id="visual_buffer_label")
+        yield Static("clipboard_obs.png\n(waiting for screenshot)", id="visual_buffer")
+        yield Button("Clear Buffer", id="clear_visual_buffer", variant="warning")
         yield Static("PATHETIC METER", id="pathetic_meter")
         yield VerticalProgressBar(max_value=10, value=0, height=10, id="pathetic_meter_bar")
         yield Static("0/10", id="pathetic_meter_value")

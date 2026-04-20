@@ -186,6 +186,7 @@ async def _cmd_help(args: list[str], engine: object, settings: Settings) -> Comm
         "[b]Available commands:[/b]",
         "  [cyan]/box <name>[/cyan]         — Load IppSec context for a known box",
         "  [cyan]/new-box <name>[/cyan]     — Start exploration mode for an unknown box",
+        "  [cyan]/vision[/cyan]             — Analyze latest clipboard screenshot",
         "  [cyan]/loot[/cyan]               — Generate a loot report for the current box",
         "  [cyan]/victory <text>[/cyan]     — Record post-pwn explanation in learnings vault",
         "  [cyan]/clear[/cyan]              — Clear the current box session from Redis",
@@ -204,6 +205,17 @@ async def _cmd_loot(args: list[str], engine: object, settings: Settings) -> Comm
         context_loaded=False,
         exploration_mode=False,
         session_prefix="__loot__",
+    )
+
+
+async def _cmd_vision(args: list[str], engine: object, settings: Settings) -> CommandResult:
+    """Analyze the latest clipboard screenshot via the multimodal model path."""
+    return CommandResult(
+        message="[dim]Routing clipboard screenshot to vision analysis...[/dim]",
+        new_target=None,
+        context_loaded=False,
+        exploration_mode=False,
+        session_prefix="__vision__",
     )
 
 
@@ -294,6 +306,7 @@ _REGISTRY: dict[str, _Handler] = {
     "box": _cmd_box,
     "new-box": _cmd_new_box,
     "newbox": _cmd_new_box,      # typo-tolerant alias
+    "vision": _cmd_vision,
     "loot": _cmd_loot,
     "exit": _cmd_exit,
     "quit": _cmd_exit,

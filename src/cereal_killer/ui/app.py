@@ -16,7 +16,12 @@ from textual.widgets import Button, Input
 
 from cereal_killer.engine import LLMEngine
 from cereal_killer.knowledge_base import KnowledgeBase
-from cereal_killer.observer import observe_history_events
+from cereal_killer.observer import (
+    ClipboardImageDetected,
+    ClipboardImageWatcher,
+    clear_clipboard_buffer,
+    observe_history_events,
+)
 from mentor.engine.commands import CommandResult, dispatch as dispatch_command
 from mentor.engine.methodology import audit_command as audit_methodology
 from mentor.kb.query import retrieve_solution_for_machine
@@ -29,6 +34,11 @@ from .widgets import PulsingEasyButton
 
 _AUTO_COACH_COOLDOWN_SECS = 10
 CODE_BLOCK_PATTERN = re.compile(r"```(?:[a-zA-Z0-9_+-]+)?\n(.*?)```", re.DOTALL)
+VISION_BUFFER_PATH = Path("data/temp/clipboard_obs.png")
+VISION_PROMPT = (
+    "Zero Cool, I've just pasted a screenshot. "
+    "Look at the error/output and tell me where I'm failing."
+)
 
 
 class CerealKillerApp(App[None]):
@@ -46,6 +56,8 @@ class CerealKillerApp(App[None]):
         self.sub_title = "TARGET: NONE"
         self.history_context: list[str] = []
         self.observer_task: asyncio.Task[None] | None = None
+        self.clipboard_task: asyncio.Task[None] | None = None
+        self.clipboard_watcher = ClipboardImageWatcher(output_path=VISION_BUFFER_PATH)
         self.last_code_block = ""
         self.pathetic_meter = 0
         self.easy_usage_count = 0
@@ -68,6 +80,7 @@ class CerealKillerApp(App[None]):
         self.set_interval(300, self._schedule_persist_mental_state)
         self.set_interval(60, self._schedule_context_prune)
         self.observer_task = asyncio.create_task(self._observe())
+        self.clipboard_task = asyncio.create_task(self._watch_clipboard())
         asyncio.create_task(self._run_boot_sequence())
         if hasattr(self.engine, "set_web_search_callback"):
             self.engine.set_web_search_callback(self._on_web_search_state)
@@ -75,6 +88,8 @@ class CerealKillerApp(App[None]):
     async def on_unmount(self) -> None:
         if self.observer_task:
             self.observer_task.cancel()
+        if self.clipboard_task:
+            self.clipboard_task.cancel()
         if hasattr(self.engine, "persist_mental_state"):
             await self.engine.persist_mental_state(self.history_context)
         self._save_session_snapshot("app-close")
@@ -113,7 +128,46 @@ class CerealKillerApp(App[None]):
             return
         if result.session_prefix == "__loot__":
             await self._handle_loot_report()
+        if result.session_prefix == "__vision__":
+            await self._handle_vision_report()
         dashboard.set_active_tool("Idle")
+
+    async def _handle_vision_report(self) -> None:
+        dashboard = self._dashboard()
+        if not VISION_BUFFER_PATH.exists():
+            dashboard.append_system(
+                "No clipboard screenshot captured yet. Copy an image and retry /vision.",
+                style="yellow",
+            )
+            return
+
+        dashboard.set_active_tool("Vision")
+        dashboard.append_system(
+            f"Analyzing screenshot from {VISION_BUFFER_PATH.name}...",
+            style="bold green",
+        )
+        try:
+            response = await self.engine.chat_with_image(
+                user_prompt=VISION_PROMPT,
+                image_path=str(VISION_BUFFER_PATH),
+                history_commands=self.history_context,
+                pathetic_meter=self.pathetic_meter,
+            )
+        except Exception as exc:
+            dashboard.append_system(f"Vision analysis error: {exc}", style="red")
+            dashboard.set_active_tool("Idle")
+            return
+
+        try:
+            await self._safe_stream_thought(response.reasoning_content or response.thought)
+            self._track_code_block(response.answer)
+            self._warn_if_repetitive_response(response.answer)
+            self._append_chat("assistant", response.answer)
+            dashboard.append_assistant(response.answer)
+        except Exception as exc:
+            dashboard.append_system(f"Vision UI error: {exc}", style="red")
+        finally:
+            dashboard.set_active_tool("Idle")
 
     async def _handle_brain_prompt(self, prompt: str) -> None:
         dashboard = self._dashboard()
@@ -224,6 +278,38 @@ class CerealKillerApp(App[None]):
             except Exception as exc:
                 dashboard.append_system(f"Auto-coach error: {exc}", style="red")
                 dashboard.set_active_tool("Idle")
+
+    async def _watch_clipboard(self) -> None:
+        async for detected in self.clipboard_watcher.watch():
+            self.post_message(detected)
+
+    def on_clipboard_image_detected(self, message: ClipboardImageDetected) -> None:
+        snapshot = message.snapshot
+        dims = ""
+        try:
+            from PIL import Image
+
+            with Image.open(snapshot.image_path) as image:
+                dims = f" ({image.width}x{image.height})"
+        except Exception:
+            dims = ""
+
+        description = f"{snapshot.image_path.name}{dims}"
+        self._dashboard().set_visual_buffer(description, snapshot.preview)
+        self.notify(
+            f"Clipboard image buffered as {snapshot.image_path.name}",
+            title="Visual Buffer",
+            severity="information",
+        )
+
+    @on(Button.Pressed, "#clear_visual_buffer")
+    def clear_visual_buffer(self) -> None:
+        ok = clear_clipboard_buffer(VISION_BUFFER_PATH)
+        self._dashboard().clear_visual_buffer()
+        if ok:
+            self.notify("Visual buffer cleared", title="Visual Buffer", severity="information")
+        else:
+            self.notify("Could not clear visual buffer", title="Visual Buffer", severity="warning")
                 continue
 
             try:

@@ -15,6 +15,8 @@ dependencies = [
   "openai>=1.40.0",
   "httpx>=0.27.0",
   "pyperclip>=1.9.0",
+  "Pillow>=10.4.0",
+  "python-multipart>=0.0.9",
   "pyautogui>=0.9.54",
   "mss>=9.0.1",
 ]

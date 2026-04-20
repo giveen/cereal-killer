@@ -23,11 +23,36 @@ Screen {
 }
 
 #chat_log {
-    height: 1fr;
+    height: 2fr;
     border: tall #2ce38c;
     background: #07120c;
     color: #bcffd8;
     padding: 0 1;
+}
+
+#response_title {
+    margin-top: 1;
+    margin-bottom: 1;
+    color: #9cffc8;
+    text-style: bold;
+}
+
+#response_markdown {
+    height: 1fr;
+    border: tall #4fd2ff;
+    background: #0a1620;
+    color: #d9f5ff;
+    padding: 0 1;
+}
+
+#response_actions {
+    height: auto;
+    margin-top: 1;
+}
+
+#copy_response,
+#copy_code {
+    margin-right: 1;
 }
 
 #thought_box {
@@ -64,6 +89,26 @@ Screen {
     padding: 1;
     margin-bottom: 1;
     color: #ffb3aa;
+}
+
+#visual_buffer_label {
+    border: tall #355c7d;
+    padding: 1;
+    margin-bottom: 0;
+    color: #b5d9ff;
+}
+
+#visual_buffer {
+    border: tall #4fd2ff;
+    padding: 1;
+    margin-bottom: 1;
+    background: #08121d;
+    color: #d6efff;
+    height: 14;
+}
+
+#clear_visual_buffer {
+    margin-bottom: 1;
 }
 
 #pathetic_meter {

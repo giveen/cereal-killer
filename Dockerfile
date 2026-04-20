@@ -19,6 +19,11 @@ COPY src /app/src
 COPY scripts /app/scripts
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --upgrade pip && pip install .
+    pip install --upgrade pip && pip install . \
+    && python - <<'PY'
+import PIL
+import multipart
+print("vision deps ok")
+PY
 
 CMD ["cereal-killer"]
