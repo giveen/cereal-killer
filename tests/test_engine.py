@@ -21,6 +21,34 @@ class ParseLLMResponseTests(unittest.TestCase):
         self.assertEqual(response.thought, "")
         self.assertEqual(response.answer, "plain answer")
 
+    def test_extracts_response_from_plain_thought_template(self) -> None:
+        payload = (
+            "thought\n"
+            "The user suspects command injection.\n"
+            "Response:\n"
+            "\"Try 127.0.0.1 first, then append ;whoami and report output.\""
+        )
+        response = parse_llm_response(payload)
+        self.assertIn("suspects command injection", response.thought)
+        self.assertEqual(
+            response.answer,
+            "Try 127.0.0.1 first, then append ;whoami and report output.",
+        )
+
+    def test_falls_back_to_thought_when_answer_empty(self) -> None:
+        response = parse_llm_response("<thought>Use | as separator and inspect output</thought>")
+        self.assertEqual(response.thought, "Use | as separator and inspect output")
+        self.assertEqual(response.answer, "Use | as separator and inspect output")
+
+    def test_extracts_response_section_from_mixed_text(self) -> None:
+        payload = (
+            "Some preamble from model.\n"
+            "Response:\n"
+            "\"Try 127.0.0.1|id and compare with baseline output.\""
+        )
+        response = parse_llm_response(payload)
+        self.assertEqual(response.answer, "Try 127.0.0.1|id and compare with baseline output.")
+
 
 class PruneThresholdTests(unittest.TestCase):
     def test_prune_threshold_is_80_percent_of_context(self) -> None:

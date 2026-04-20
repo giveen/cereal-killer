@@ -553,4 +553,41 @@ def parse_brain_output(content: str) -> BrainResponse:
     thoughts = THOUGHT_PATTERN.findall(content)
     thought = "\n\n".join(item.strip() for item in thoughts if item.strip())
     answer = THOUGHT_PATTERN.sub("", content).strip()
+
+    # Fallback for providers that return plain-text templates like:
+    # "thought\n...\nResponse:\n\"final answer\"" instead of <thought> tags.
+    if not thought and answer.lower().startswith("thought") and "response:" in answer.lower():
+        pre, post = re.split(r"response:\s*", answer, maxsplit=1, flags=re.IGNORECASE)
+        candidate_thought = re.sub(r"^thought\s*", "", pre, count=1, flags=re.IGNORECASE).strip()
+        candidate_answer = post.strip()
+        if (
+            len(candidate_answer) >= 2
+            and candidate_answer[0] == candidate_answer[-1]
+            and candidate_answer[0] in {'"', "'"}
+        ):
+            candidate_answer = candidate_answer[1:-1].strip()
+        if candidate_thought:
+            thought = candidate_thought
+        if candidate_answer:
+            answer = candidate_answer
+
+    # Some providers return mixed prose where `Response:` appears later;
+    # prefer the explicit response section if present.
+    if "response:" in answer.lower():
+        parts = re.split(r"response:\s*", answer, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) == 2:
+            candidate = parts[1].strip()
+            if (
+                len(candidate) >= 2
+                and candidate[0] == candidate[-1]
+                and candidate[0] in {'"', "'"}
+            ):
+                candidate = candidate[1:-1].strip()
+            if candidate:
+                answer = candidate
+
+    # Never return an empty visible answer; this prevents "silent" turns.
+    if not answer.strip() and thought.strip():
+        answer = thought
+
     return BrainResponse(thought=thought, answer=answer, raw_content=content, reasoning_content="")
