@@ -233,3 +233,57 @@ class TestTieredSearch(unittest.TestCase):
         result = asyncio.run(run())
         assert "uncharted territory" in result.reference_block
         assert "cite" in result.reference_block.lower()
+
+    def test_tiered_search_returns_early_when_within_timeout(self) -> None:
+        """When search completes within timeout, normal results are returned."""
+        quick_snippets = [
+            RAGSnippet("ippsec", "lame", "T", "http://u", "content", score=0.1)
+        ]
+        async def run():
+            with patch("mentor.engine.search_orchestrator.retrieve_reference_material", return_value=quick_snippets), \
+                 patch("mentor.engine.search_orchestrator.web_search") as mock_ws:
+                # timeout=60 should be enough for mocked search to complete
+                result = await tiered_search("test", self._settings(), rag_timeout=60)
+                mock_ws.assert_not_called()
+                return result
+        result = asyncio.run(run())
+        assert not result.used_web
+        assert len(result.vector_snippets) == 1
+
+    def test_tiered_search_times_out_returns_partial_result(self) -> None:
+        """When search exceeds rag_timeout, partial result is returned with timeout message."""
+        partial_snippets = [RAGSnippet("ippsec", "lame", "T", "http://u", "content", score=0.1)]
+
+        async def run():
+            async def slow_web_search(*args, **kwargs):
+                await asyncio.sleep(5)  # longer than timeout
+                return [WebResult("WR", "https://wr.com", "snippet")]
+            
+            with patch("mentor.engine.search_orchestrator.retrieve_reference_material", return_value=partial_snippets), \
+                 patch("mentor.engine.search_orchestrator.web_search", side_effect=slow_web_search), \
+                 patch("mentor.engine.search_orchestrator._best_vector_score", return_value=0.3):  # below threshold
+                result = await tiered_search("slow query", self._settings(), rag_timeout=0.1)
+                assert "timed out" in result.reference_block.lower()
+                return result
+
+        result = asyncio.run(run())
+        assert result.vector_snippets == partial_snippets
+
+    def test_tiered_search_partial_data_preserved_on_timeout(self) -> None:
+        """When timeout occurs after partial work, partial data is preserved."""
+        partial_snippets = [RAGSnippet("ippsec", "lame", "T", "http://u", "partial", score=0.3)]
+        async def run():
+            async def fast_web_search_then_timeout(*args, **kwargs):
+                # This is the slow call inside _run_pipeline that gets wrapped by wait_for
+                await asyncio.sleep(5)
+                return []
+            
+            with patch("mentor.engine.search_orchestrator.retrieve_reference_material", return_value=partial_snippets), \
+                 patch("mentor.engine.search_orchestrator.web_search", side_effect=fast_web_search_then_timeout), \
+                 patch("mentor.engine.search_orchestrator._best_vector_score", return_value=0.3):  # below threshold
+                result = await tiered_search("partial query", self._settings(), rag_timeout=0.1)
+                assert "timed out" in result.reference_block.lower()
+                assert len(result.vector_snippets) == 1
+                return result
+        result = asyncio.run(run())
+        assert len(result.vector_snippets) == 1

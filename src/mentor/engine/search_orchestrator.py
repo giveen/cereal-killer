@@ -16,6 +16,14 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import logging
+
+logger = logging.getLogger(__name__)
+
+try:
+    from asyncio import TimeoutError as _AsyncioTimeoutError
+except ImportError:
+    _AsyncioTimeoutError = asyncio.CancelledError  # type: ignore[misc,assignment]
 
 from cereal_killer.config import Settings
 from mentor.kb.query import (
@@ -163,6 +171,7 @@ async def tiered_search(
     top_k: int = 3,
     source_filters: list[str] | None = None,
     reference_token_budget: int = _REFERENCE_TOKEN_BUDGET,
+    rag_timeout: float | None = None,
 ) -> SearchResult:
     """Run the tiered search pipeline.
 
@@ -181,60 +190,97 @@ async def tiered_search(
     max_web_results:
         Cap on live results forwarded to the LLM.
     """
-    # --- Tier 1: Local Redis Vector DB -----------------------------------
-    vector_snippets = retrieve_reference_material(
-        settings,
-        command_or_prompt=query,
-        context_commands=history_commands,
-        top_k=top_k,
-        target_machine=target_machine,
-        index_order=_resolve_index_priority(settings),
-        source_filters=source_filters,
-    )
-    vector_snippets = _trim_snippets_to_budget(
-        vector_snippets,
-        target_machine=target_machine,
-        token_budget=reference_token_budget,
-    )
-    best_score = _best_vector_score(vector_snippets)
+    # --- Timeout wrapper ---------------------------------------------------
+    if rag_timeout is None:
+        rag_timeout = getattr(settings, "rag_timeout", 10.0)
 
-    needs_web = force_web or (best_score < vector_threshold)
-    web_results: list[WebResult] = []
+    _search_result: SearchResult | None = None
+    _timed_out = False
 
-    # --- Tier 2: Live SearXNG (last resort) — only when pedagogy permits ---
-    if needs_web and allow_web and settings.searxng_base_url:
-        web_results = await web_search(
-            query,
-            base_url=settings.searxng_base_url,
-            max_results=max_web_results,
+    async def _run_pipeline() -> SearchResult:
+        # --- Tier 1: Local Redis Vector DB -----------------------------------
+        vector_snippets = retrieve_reference_material(
+            settings,
+            command_or_prompt=query,
+            context_commands=history_commands,
+            top_k=top_k,
+            target_machine=target_machine,
+            index_order=_resolve_index_priority(settings),
+            source_filters=source_filters,
+        )
+        nonlocal _search_result
+        _search_result = SearchResult(
+            reference_block=format_reference_material(vector_snippets) if vector_snippets else "Reference Material: none",
+            vector_snippets=vector_snippets,
+            web_results=[],
+            top_similarity_scores=top_similarity_scores(vector_snippets, top_n=3),
+        )
+        vector_snippets = _trim_snippets_to_budget(
+            vector_snippets,
+            target_machine=target_machine,
+            token_budget=reference_token_budget,
+        )
+        # Update partial result with trimmed snippets
+        _search_result.vector_snippets = vector_snippets
+        best_score = _best_vector_score(vector_snippets)
+
+        needs_web = force_web or (best_score < vector_threshold)
+        web_results: list[WebResult] = []
+
+        # --- Tier 2: Live SearXNG (last resort) — only when pedagogy permits ---
+        if needs_web and allow_web and settings.searxng_base_url:
+            web_results = await web_search(
+                query,
+                base_url=settings.searxng_base_url,
+                max_results=max_web_results,
+            )
+
+        # --- Compose reference block -----------------------------------------
+        parts: list[str] = []
+
+        if vector_snippets:
+            parts.append(format_reference_material(vector_snippets))
+
+        if web_results:
+            no_local = not bool(vector_snippets)
+            preamble = (
+                "I've checked local Gibson sources (IppSec, GTFOBins/LOLBAS, HackTricks, Payloads). "
+                "We're in uncharted territory. I'm hitting the web for this one.\n"
+                if no_local else
+                "Zero Cool had to check the live web for this one.\n"
+            )
+            parts.append(
+                preamble
+                + "Cite the URLs below if you use any of this information.\n\n"
+                + format_web_results(web_results)
+            )
+
+        reference_block = "\n\n".join(parts) if parts else "Reference Material: none"
+
+        return SearchResult(
+            reference_block=reference_block,
+            used_web=bool(web_results),
+            vector_snippets=vector_snippets,
+            web_results=web_results,
+            top_similarity_scores=top_similarity_scores(vector_snippets, top_n=3),
         )
 
-    # --- Compose reference block -----------------------------------------
-    parts: list[str] = []
-
-    if vector_snippets:
-        parts.append(format_reference_material(vector_snippets))
-
-    if web_results:
-        no_local = not bool(vector_snippets)
-        preamble = (
-            "I've checked local Gibson sources (IppSec, GTFOBins/LOLBAS, HackTricks, Payloads). "
-            "We're in uncharted territory. I'm hitting the web for this one.\n"
-            if no_local else
-            "Zero Cool had to check the live web for this one.\n"
-        )
-        parts.append(
-            preamble
-            + "Cite the URLs below if you use any of this information.\n\n"
-            + format_web_results(web_results)
+    try:
+        _search_result = await asyncio.wait_for(_run_pipeline(), timeout=rag_timeout)
+    except (_AsyncioTimeoutError, TimeoutError):
+        logger.warning("RAG search timed out after %.1fs", rag_timeout)
+        _timed_out = True
+        _search_result = SearchResult(
+            reference_block=(
+                "Reference Material (partial): "
+                "Search timed out. Consider increasing RAG_TIMEOUT setting."
+            ),
+            vector_snippets=_search_result.vector_snippets if _search_result else [],
+            web_results=_search_result.web_results if _search_result else [],
+            top_similarity_scores=(
+                top_similarity_scores(_search_result.vector_snippets, top_n=3)
+                if _search_result else []
+            ),
         )
 
-    reference_block = "\n\n".join(parts) if parts else "Reference Material: none"
-
-    return SearchResult(
-        reference_block=reference_block,
-        used_web=bool(web_results),
-        vector_snippets=vector_snippets,
-        web_results=web_results,
-        top_similarity_scores=top_similarity_scores(vector_snippets, top_n=3),
-    )
+    return _search_result

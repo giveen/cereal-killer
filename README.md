@@ -159,6 +159,7 @@ Use environment variables (from `.env` in Docker or your shell locally):
 - `BACKEND_TRACE_MAX_CHARS` (default `8000`)
 - `HISTORY_PATH` (default auto-detect; fallback `~/.bash_history`) — shell history file watched by Terminal Link
 - `GIBSON_SKIP_ENV_CHECK` (default `0`) — set `1` to bypass local setup validation when running against remote infra
+- `RAG_TIMEOUT` (default `10`) — seconds before tiered RAG search times out and returns partial results
 
 Docker compose also sets:
 
@@ -478,6 +479,83 @@ MODEL_DIR=/path/to/your/models make check
 # or
 GIBSON_MODEL_DIR=/path/to/your/models make
 ```
+
+## System Architecture
+
+### High-Level Overview
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    TEXTUAL TUI (app.py)                      │
+│  ┌─────────┬──────────┬───────────┬───────────────────────┐ │
+│  │ Chat    │ Gibson   │ Ops       │ Sidebar               │ │
+│  │ Viewer  │ (RAG)    │ (Status)  │ (Phase, Sync, Cache)  │ │
+│  └─────────┴──────────┴───────────┴───────────────────────┘ │
+│  CommandInput | ChatLog | Markdown | LoadingIndicator       │
+└──────────────────────────────────────────────────────────────┘
+         │                              │
+    ┌────▼─────┐                  ┌─────▼──────────┐
+    │Engine    │                  │ Knowledge Base │
+    │ Workers: │                  │ RedisVL        │
+    │ - chat   │                  │ - Vector Index │
+    │ - vision │                  │ - Lexical      │
+    │ - search │                  │ - Embeddings   │
+    └────┬─────┘                  └────────────────┘
+         │
+    ┌────▼─────────┐
+    │     Brain     │
+    │ - System     │
+    │   Prompt     │
+    │ - Tiered     │
+    │   Search     │
+    │ - Session    │
+    │   State      │
+    │ - Snark      │
+    │   Calibration│
+    └────┬─────────┘
+         │
+    ┌────▼──────────────┐
+    │  LLM Backend       │
+    │  OpenAI/LiteLLM    │
+    │  (llama-swap/API)  │
+    └───────────────────┘
+
+    ┌──────────────────────┐
+    │  Shell History       │
+    │  (watchfiles)        │
+    │  → detect_phase      │
+    │  → detect_feedback   │
+    │  → detect_box_cd     │
+    └──────────────────────┘
+```
+
+### Component Layers
+
+| Layer | Components | Purpose |
+|-------|-----------|---------|
+| **UI** | `cereal_killer/ui/` | Textual TUI, responsive layout, event handling |
+| **Engine** | `cereal_killer/engine.py` | LLM orchestration, context pruning, pedagogy |
+| **Brain** | `mentor/engine/brain.py` | LLM interaction, system prompts, session state |
+| **Knowledge** | `mentor/kb/query.py`, `cereal_killer/knowledge_base.py` | RedisVL hybrid search (vector + lexical) |
+| **Observer** | `mentor/observer/stalker.py` | Async shell history watcher |
+| **Commands** | `mentor/engine/commands.py` | Slash command router |
+
+### Data Flow
+
+1. **User Input** → `CerealKillerApp.on_input_submitted()` → routes to `/command` handler or chat worker
+2. **Shell History** → `observe_history_events()` → `HistoryEvent` → `CerealKillerApp._observe()` → auto-coach
+3. **LLM Call** → `Brain.ask()` → `tiered_search()` → RedisVL → LLM API → response parsed → UI update
+4. **Knowledge Sync** → `sync_all_command()` → fetch repos → chunk → embed → store in RedisVL
+
+### Configuration
+
+Key environment variables:
+- `LLM_BASE_URL` - OpenAI-compatible API endpoint
+- `REDIS_URL` - Redis connection string
+- `MAX_MODEL_LEN` - Context window size in tokens
+- `PRESERVE_THINKING` - Enable thinking buffer persistence
+- `BACKEND_TRACE_ENABLED` - Enable LLM request/response tracing
+- `HISTORY_PATH` - Shell history file to observe
 
 ## Contributing
 

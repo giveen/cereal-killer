@@ -88,6 +88,9 @@ class Settings:
     }
     backend_trace_path: str = os.getenv("BACKEND_TRACE_PATH", "logs/llm_backend.log")
     backend_trace_max_chars: int = int(os.getenv("BACKEND_TRACE_MAX_CHARS", "8000"))
+    # RAG search timeout in seconds. If the tiered search takes longer than this,
+    # partial results are returned to avoid blocking the UI.
+    rag_timeout: float = float(os.getenv("RAG_TIMEOUT", "10"))
 
 
 HISTORY_CONTEXT_LIMIT = 50
