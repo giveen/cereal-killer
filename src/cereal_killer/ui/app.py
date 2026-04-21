@@ -6,8 +6,10 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import time as _time
 from datetime import UTC, datetime
+from typing import Any
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlparse
@@ -95,6 +97,8 @@ class CerealKillerApp(App[None]):
         self.current_target: str = ""
         self._pruning_in_flight = False
         self._analysis_jobs = 0
+        # Worker tracking for cancellation safety
+        self._active_workers: dict[str, asyncio.Task[None]] = {}
         self._uploaded_image_path: Path | None = None
         self._gibson_snippets: list[dict] = []
         self._vision_analyzed_sources: set[str] = set()
@@ -139,6 +143,8 @@ class CerealKillerApp(App[None]):
             self.observer_task.cancel()
         if self.clipboard_task:
             self.clipboard_task.cancel()
+        # Cancel all pending workers
+        self.cancel_all_workers()
         if hasattr(self.engine, "persist_mental_state"):
             await self.engine.persist_mental_state(self.history_context)
         self._save_session_snapshot("app-close")
@@ -358,49 +364,58 @@ class CerealKillerApp(App[None]):
 
     @work(exclusive=True, thread=False, group="llm")
     async def _run_chat_worker(self, prompt: str) -> None:
-        import asyncio as _asyncio
         dashboard = self._dashboard()
+        worker_name = self.__class__.__name__ + "." + sys._getframe().f_code.co_name.replace("_run_", "", 1)
+        self._register_worker(worker_name, asyncio.current_task())
         self._analysis_busy(True)
         dashboard.set_active_tool("Brain")
         try:
-            response = await self.engine.chat(
-                prompt,
-                self.history_context,
-                pathetic_meter=self.pathetic_meter,
-            )
-            self._update_llm_cache_metrics(response.backend_meta)
-            await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
-            phase = detect_phase(self.history_context)
-            dashboard.set_phase(phase)
-            if "pwned" in prompt.lower() or "owned" in prompt.lower():
-                self._save_session_snapshot("pwned-manual")
-        except _asyncio.CancelledError:
-            raise
+            await self._with_worker_cancellation(self._chat_body(prompt))
         except Exception as exc:
             dashboard.append_system(f"LLM error: {exc}", style="red")
         finally:
             dashboard.set_active_tool("Idle")
             self._analysis_busy(False)
+            self._unregister_worker(worker_name)
+
+    async def _chat_body(self, prompt: str) -> None:
+        response = await self.engine.chat(
+            prompt,
+            self.history_context,
+            pathetic_meter=self.pathetic_meter,
+        )
+        self._update_llm_cache_metrics(response.backend_meta)
+        await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
+        phase = detect_phase(self.history_context)
+        self._dashboard().set_phase(phase)
+        if "pwned" in prompt.lower() or "owned" in prompt.lower():
+            self._save_session_snapshot("pwned-manual")
 
     @work(exclusive=True, thread=False, group="llm")
     async def _run_loot_worker(self) -> None:
         dashboard = self._dashboard()
+        worker_name = self.__class__.__name__ + "." + sys._getframe().f_code.co_name.replace("_run_", "", 1)
+        self._register_worker(worker_name, asyncio.current_task())
         machine_name = Path.cwd().name
         self._analysis_busy(True)
         dashboard.set_active_tool("Loot")
         dashboard.append_system(f"Generating loot report for {machine_name}...", style="bold green")
         try:
-            response = await self.engine.generate_loot_report(
-                history_commands=self.history_context,
-                pathetic_meter=self.pathetic_meter,
-            )
-            self._update_llm_cache_metrics(response.backend_meta)
-            await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
+            await self._with_worker_cancellation(self._loot_body())
         except Exception as exc:
             dashboard.append_system(f"Loot report error: {exc}", style="red")
         finally:
             dashboard.set_active_tool("Idle")
             self._analysis_busy(False)
+            self._unregister_worker(worker_name)
+
+    async def _loot_body(self) -> None:
+        response = await self.engine.generate_loot_report(
+            history_commands=self.history_context,
+            pathetic_meter=self.pathetic_meter,
+        )
+        self._update_llm_cache_metrics(response.backend_meta)
+        await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
 
     @work(exclusive=True, thread=False, group="llm")
     async def _run_vision_worker(
@@ -410,6 +425,8 @@ class CerealKillerApp(App[None]):
         mark_context: bool = False,
     ) -> None:
         dashboard = self._dashboard()
+        worker_name = self.__class__.__name__ + "." + sys._getframe().f_code.co_name.replace("_run_", "", 1)
+        self._register_worker(worker_name, asyncio.current_task())
         image_file = Path(image_path)
         if not image_file.exists():
             dashboard.append_system(f"Vision input missing: {image_file}", style="yellow")
@@ -423,17 +440,7 @@ class CerealKillerApp(App[None]):
         dashboard.append_system(f"Image Uploaded: {image_file.name} ({source_label})", style="bold cyan")
         dashboard.append_system(f"Zero Cool is analyzing {image_file.name}...", style="bold green")
         try:
-            response = await self.engine.chat_with_image(
-                user_prompt=VISION_PROMPT,
-                image_path=str(image_file),
-                history_commands=self.history_context,
-                pathetic_meter=self.pathetic_meter,
-            )
-            self._update_llm_cache_metrics(response.backend_meta)
-            await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
-            self._vision_analyzed_sources.add(str(image_file.expanduser().resolve()))
-            if mark_context:
-                dashboard.set_upload_progress(100, "IMAGE INGEST")
+            await self._with_worker_cancellation(self._vision_body(str(image_file), mark_context))
         except Exception as exc:
             dashboard.append_system(f"Vision analysis error: {exc}", style="red")
             if mark_context:
@@ -441,10 +448,28 @@ class CerealKillerApp(App[None]):
         finally:
             dashboard.set_active_tool("Idle")
             self._analysis_busy(False)
+            self._unregister_worker(worker_name)
+
+    async def _vision_body(self, image_path: str, mark_context: bool) -> None:
+        image_file = Path(image_path)
+        response = await self.engine.chat_with_image(
+            user_prompt=VISION_PROMPT,
+            image_path=str(image_file),
+            history_commands=self.history_context,
+            pathetic_meter=self.pathetic_meter,
+        )
+        self._update_llm_cache_metrics(response.backend_meta)
+        await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
+        self._vision_analyzed_sources.add(str(image_file.expanduser().resolve()))
+        dashboard = self._try_dashboard()
+        if dashboard and mark_context:
+            dashboard.set_upload_progress(100, "IMAGE INGEST")
 
     @work(exclusive=True, thread=False, group="llm")
     async def _run_document_ingest_worker(self, file_path: str) -> None:
         dashboard = self._dashboard()
+        worker_name = self.__class__.__name__ + "." + sys._getframe().f_code.co_name.replace("_run_", "", 1)
+        self._register_worker(worker_name, asyncio.current_task())
         path = Path(file_path)
         if not is_document_path(path):
             dashboard.append_system(f"Unsupported document type: {path.suffix}", style="yellow")
@@ -455,15 +480,7 @@ class CerealKillerApp(App[None]):
         dashboard.set_upload_progress(20, "DOC INGEST")
         dashboard.set_context_chip(path.name, ingest_type="document")
         try:
-            payload = build_document_prompt(path)
-            dashboard.set_upload_progress(55, "DOC INGEST")
-            response = await self.engine.chat(
-                payload.prompt,
-                self.history_context,
-                pathetic_meter=self.pathetic_meter,
-            )
-            self._update_llm_cache_metrics(response.backend_meta)
-            await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
+            await self._with_worker_cancellation(self._doc_ingest_body(str(path)))
             dashboard.append_system(f"Document Uploaded: {path.name}", style="bold cyan")
             dashboard.set_upload_progress(100, "DOC INGEST")
         except json.JSONDecodeError as exc:
@@ -475,29 +492,52 @@ class CerealKillerApp(App[None]):
         finally:
             dashboard.set_active_tool("Idle")
             self._analysis_busy(False)
+            self._unregister_worker(worker_name)
+
+    async def _doc_ingest_body(self, path_str: str) -> None:
+        path = Path(path_str)
+        payload = build_document_prompt(path)
+        dashboard = self._try_dashboard()
+        if dashboard:
+            dashboard.set_upload_progress(55, "DOC INGEST")
+        response = await self.engine.chat(
+            payload.prompt,
+            self.history_context,
+            pathetic_meter=self.pathetic_meter,
+        )
+        self._update_llm_cache_metrics(response.backend_meta)
+        await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
 
     @work(exclusive=True, thread=False, group="coach")
     async def _run_autocoach_worker(self, command: str) -> None:
         dashboard = self._dashboard()
+        worker_name = self.__class__.__name__ + "." + sys._getframe().f_code.co_name.replace("_run_", "", 1)
+        self._register_worker(worker_name, asyncio.current_task())
         self._analysis_busy(True)
         dashboard.set_active_tool("Brain")
         try:
-            response = await self.engine.react_to_command(
-                command,
-                self.history_context,
-                pathetic_meter=self.pathetic_meter,
-            )
-            self._update_llm_cache_metrics(response.backend_meta)
-            await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
+            await self._with_worker_cancellation(self._autocoach_body(command))
         except Exception as exc:
             dashboard.append_system(f"Auto-coach error: {exc}", style="red")
         finally:
             dashboard.set_active_tool("Idle")
             self._analysis_busy(False)
+            self._unregister_worker(worker_name)
+
+    async def _autocoach_body(self, command: str) -> None:
+        response = await self.engine.react_to_command(
+            command,
+            self.history_context,
+            pathetic_meter=self.pathetic_meter,
+        )
+        self._update_llm_cache_metrics(response.backend_meta)
+        await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
 
     @work(exclusive=True, thread=False, group="llm")
     async def _run_search_worker(self, query: str) -> None:
         dashboard = self._dashboard()
+        worker_name = self.__class__.__name__ + "." + sys._getframe().f_code.co_name.replace("_run_", "", 1)
+        self._register_worker(worker_name, asyncio.current_task())
         self._analysis_busy(True)
         dashboard.set_active_tool("Search")
         self.notify(
@@ -507,19 +547,30 @@ class CerealKillerApp(App[None]):
         )
         dashboard.append_system(f"Searching local Gibson memory for '{query}'...", style="bold cyan")
         try:
-            source_filters = self._extract_source_filters(query)
-            search_result = await tiered_search(
-                query=query,
-                settings=self.kb.settings,
-                history_commands=[],
-                target_machine=None,
-                allow_web=False,
-                force_web=False,
-                top_k=12,
-                source_filters=source_filters,
-            )
-            chunks = search_result.vector_snippets
-            top_scores = ", ".join(f"{score:.3f}" for score in search_result.top_similarity_scores) or "none"
+            await self._with_worker_cancellation(self._search_body(query))
+        except Exception as exc:
+            dashboard.append_system(f"Search error: {exc}", style="red")
+        finally:
+            dashboard.set_active_tool("Idle")
+            self._analysis_busy(False)
+            self._unregister_worker(worker_name)
+
+    async def _search_body(self, query: str) -> None:
+        source_filters = self._extract_source_filters(query)
+        search_result = await tiered_search(
+            query=query,
+            settings=self.kb.settings,
+            history_commands=[],
+            target_machine=None,
+            allow_web=False,
+            force_web=False,
+            top_k=12,
+            source_filters=source_filters,
+        )
+        chunks = search_result.vector_snippets
+        top_scores = ", ".join(f"{score:.3f}" for score in search_result.top_similarity_scores) or "none"
+        dashboard = self._try_dashboard()
+        if dashboard:
             dashboard.append_system(f"RAG top-3 similarity: {top_scores}", style="bold cyan")
             dashboard.append_system(
                 f"Gibson found {len(chunks)} relevant matches in local memory.",
@@ -564,11 +615,6 @@ class CerealKillerApp(App[None]):
                 dashboard.append_system("Relevant diagram found. Use [VIEW IMAGE] in the Media Drawer.", style="bold cyan")
             dashboard.set_gibson_results(self._gibson_snippets)
             dashboard.set_active_view("gibson")
-        except Exception as exc:
-            dashboard.append_system(f"Search error: {exc}", style="red")
-        finally:
-            dashboard.set_active_tool("Idle")
-            self._analysis_busy(False)
 
     @staticmethod
     def _extract_source_filters(query: str) -> list[str] | None:
@@ -581,62 +627,13 @@ class CerealKillerApp(App[None]):
     async def _run_gibson_search_worker(self, query: str) -> None:
         """Direct search from the Gibson tab with grouped results + auto summary."""
         dashboard = self._dashboard()
+        worker_name = self.__class__.__name__ + "." + sys._getframe().f_code.co_name.replace("_run_", "", 1)
+        self._register_worker(worker_name, asyncio.current_task())
         dashboard.set_gibson_loading(True)
         dashboard.set_active_tool("Gibson")
         self._analysis_busy(True)
         try:
-            source_filters = self._extract_source_filters(query)
-            search_result = await tiered_search(
-                query=query,
-                settings=self.kb.settings,
-                history_commands=[],
-                target_machine=None,
-                allow_web=False,
-                force_web=False,
-                top_k=15,
-                source_filters=source_filters,
-            )
-            top_scores = ", ".join(f"{score:.3f}" for score in search_result.top_similarity_scores) or "none"
-            dashboard.append_system(f"RAG top-3 similarity: {top_scores}", style="bold cyan")
-            dashboard.append_system(
-                f"Gibson found {len(search_result.vector_snippets)} relevant matches in local memory.",
-                style="bold green",
-            )
-            self._gibson_snippets = []
-            for snippet in search_result.vector_snippets:
-                row = {
-                    "title": snippet.title,
-                    "content": snippet.content,
-                    "source": snippet.source,
-                    "machine": snippet.machine,
-                    "url": snippet.url,
-                }
-                row["visual_image_url"] = self._extract_visual_candidate_url([row])
-                self._gibson_snippets.append(row)
-            remote_candidate = self._extract_visual_candidate_url(self._gibson_snippets)
-            dashboard.set_remote_image_candidate(remote_candidate)
-            if remote_candidate:
-                dashboard.append_system("Relevant diagram found. Use [VIEW IMAGE] in the Media Drawer.", style="bold cyan")
-            dashboard.set_gibson_results(self._gibson_snippets)
-
-            if self._gibson_snippets:
-                from mentor.kb.query import RAGSnippet
-
-                rag_snippets = [
-                    RAGSnippet(
-                        source=s.get("source", ""),
-                        machine=s.get("machine", ""),
-                        title=s.get("title", ""),
-                        url=s.get("url", ""),
-                        content=s.get("content", ""),
-                        score=0.0,
-                    )
-                    for s in self._gibson_snippets
-                ]
-                response = await self.engine.synthesize_search_results(query, rag_snippets)
-                self._update_llm_cache_metrics(response.backend_meta)
-                summary = f"# GIBSON SUMMARY\n\n{response.answer.strip()}"
-                dashboard.show_gibson_summary(summary)
+            await self._with_worker_cancellation(self._gibson_search_body(query))
         except Exception as exc:
             try:
                 dashboard.query_one("#gibson_viewer", Markdown).update(f"_Search error: {exc}_")
@@ -646,19 +643,49 @@ class CerealKillerApp(App[None]):
             dashboard.set_active_tool("Idle")
             dashboard.set_gibson_loading(False)
             self._analysis_busy(False)
+            self._unregister_worker(worker_name)
 
-    @work(exclusive=True, thread=False, group="llm")
-    async def _run_gibson_synthesize_worker(self) -> None:
-        """LLM-synthesize all current Gibson snippets into a master cheat sheet."""
-        from mentor.kb.query import RAGSnippet
-
+    async def _gibson_search_body(self, query: str) -> None:
+        """Perform tiered search and LLM synthesis for Gibson tab."""
         dashboard = self._dashboard()
-        self._analysis_busy(True)
-        dashboard.set_active_tool("Synthesize")
-        dashboard.set_gibson_loading(True)
-        try:
-            query = dashboard.query_one("#gibson_search_input", Input).value or "summarize"
-            snippets = [
+        source_filters = self._extract_source_filters(query)
+        search_result = await tiered_search(
+            query=query,
+            settings=self.kb.settings,
+            history_commands=[],
+            target_machine=None,
+            allow_web=False,
+            force_web=False,
+            top_k=15,
+            source_filters=source_filters,
+        )
+        top_scores = ", ".join(f"{score:.3f}" for score in search_result.top_similarity_scores) or "none"
+        dashboard.append_system(f"RAG top-3 similarity: {top_scores}", style="bold cyan")
+        dashboard.append_system(
+            f"Gibson found {len(search_result.vector_snippets)} relevant matches in local memory.",
+            style="bold green",
+        )
+        self._gibson_snippets = []
+        for snippet in search_result.vector_snippets:
+            row = {
+                "title": snippet.title,
+                "content": snippet.content,
+                "source": snippet.source,
+                "machine": snippet.machine,
+                "url": snippet.url,
+            }
+            row["visual_image_url"] = self._extract_visual_candidate_url([row])
+            self._gibson_snippets.append(row)
+        remote_candidate = self._extract_visual_candidate_url(self._gibson_snippets)
+        dashboard.set_remote_image_candidate(remote_candidate)
+        if remote_candidate:
+            dashboard.append_system("Relevant diagram found. Use [VIEW IMAGE] in the Media Drawer.", style="bold cyan")
+        dashboard.set_gibson_results(self._gibson_snippets)
+
+        if self._gibson_snippets:
+            from mentor.kb.query import RAGSnippet
+
+            rag_snippets = [
                 RAGSnippet(
                     source=s.get("source", ""),
                     machine=s.get("machine", ""),
@@ -669,10 +696,22 @@ class CerealKillerApp(App[None]):
                 )
                 for s in self._gibson_snippets
             ]
-            response = await self.engine.synthesize_search_results(query, snippets)
+            response = await self.engine.synthesize_search_results(query, rag_snippets)
             self._update_llm_cache_metrics(response.backend_meta)
-            cheat_sheet = f"# MASTER CHEAT SHEET\n\n{response.answer.strip()}"
-            dashboard.query_one("#gibson_viewer", Markdown).update(cheat_sheet)
+            summary = f"# GIBSON SUMMARY\n\n{response.answer.strip()}"
+            dashboard.show_gibson_summary(summary)
+
+    @work(exclusive=True, thread=False, group="llm")
+    async def _run_gibson_synthesize_worker(self) -> None:
+        """LLM-synthesize all current Gibson snippets into a master cheat sheet."""
+        dashboard = self._dashboard()
+        worker_name = self.__class__.__name__ + "." + sys._getframe().f_code.co_name.replace("_run_", "", 1)
+        self._register_worker(worker_name, asyncio.current_task())
+        self._analysis_busy(True)
+        dashboard.set_active_tool("Synthesize")
+        dashboard.set_gibson_loading(True)
+        try:
+            await self._with_worker_cancellation(self._gibson_synthesize_body())
         except Exception as exc:
             try:
                 dashboard.query_one("#gibson_viewer", Markdown).update(f"_Synthesis error: {exc}_")
@@ -682,44 +721,75 @@ class CerealKillerApp(App[None]):
             dashboard.set_active_tool("Idle")
             self._analysis_busy(False)
             dashboard.set_gibson_loading(False)
+            self._unregister_worker(worker_name)
+
+    async def _gibson_synthesize_body(self) -> None:
+        """Synthesize current Gibson snippets into a master cheat sheet."""
+        from mentor.kb.query import RAGSnippet
+
+        dashboard = self._dashboard()
+        query = dashboard.query_one("#gibson_search_input", Input).value or "summarize"
+        snippets = [
+            RAGSnippet(
+                source=s.get("source", ""),
+                machine=s.get("machine", ""),
+                title=s.get("title", ""),
+                url=s.get("url", ""),
+                content=s.get("content", ""),
+                score=0.0,
+            )
+            for s in self._gibson_snippets
+        ]
+        response = await self.engine.synthesize_search_results(query, snippets)
+        self._update_llm_cache_metrics(response.backend_meta)
+        cheat_sheet = f"# MASTER CHEAT SHEET\n\n{response.answer.strip()}"
+        dashboard.query_one("#gibson_viewer", Markdown).update(cheat_sheet)
 
     @work(exclusive=True, thread=False, group="media")
     async def _run_remote_visual_worker(self, url: str) -> None:
         dashboard = self._dashboard()
+        worker_name = self.__class__.__name__ + "." + sys._getframe().f_code.co_name.replace("_run_", "", 1)
+        self._register_worker(worker_name, asyncio.current_task())
         dashboard.set_active_tool("Media")
         try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                response = await client.get(url, follow_redirects=True)
-                response.raise_for_status()
-
-            try:
-                from PIL import Image
-            except Exception:
-                Image = None  # type: ignore[assignment]
-
-            if Image is None:
-                dashboard.append_system("Pillow is unavailable; cannot decode remote image.", style="red")
-                return
-
-            try:
-                image = Image.open(BytesIO(response.content)).convert("RGB")
-            except Exception as exc:
-                dashboard.append_system(f"Could not decode remote image: {exc}", style="red")
-                return
-
-            remote_target = Path("data/temp/remote_visual_buffer.png")
-            remote_target.parent.mkdir(parents=True, exist_ok=True)
-            image.save(remote_target, format="PNG")
-            image.close()
-
-            self._uploaded_image_path = remote_target.resolve()
-            dashboard.set_visual_buffer_image(remote_target, source="Remote")
-            dashboard.append_system("Remote diagram loaded into Media Drawer.", style="bold cyan")
-            self.notify("Remote image loaded", title="Visual Buffer", severity="information")
+            await self._with_worker_cancellation(self._visual_body(url))
         except Exception as exc:
             dashboard.append_system(f"Remote image load failed: {exc}", style="red")
         finally:
             dashboard.set_active_tool("Idle")
+            self._unregister_worker(worker_name)
+
+    async def _visual_body(self, url: str) -> None:
+        """Fetch remote image and save to buffer."""
+        dashboard = self._dashboard()
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(url, follow_redirects=True)
+            response.raise_for_status()
+
+        try:
+            from PIL import Image
+        except Exception:
+            Image = None  # type: ignore[assignment]
+
+        if Image is None:
+            dashboard.append_system("Pillow is unavailable; cannot decode remote image.", style="red")
+            return
+
+        try:
+            image = Image.open(BytesIO(response.content)).convert("RGB")
+        except Exception as exc:
+            dashboard.append_system(f"Could not decode remote image: {exc}", style="red")
+            return
+
+        remote_target = Path("data/temp/remote_visual_buffer.png")
+        remote_target.parent.mkdir(parents=True, exist_ok=True)
+        image.save(remote_target, format="PNG")
+        image.close()
+
+        self._uploaded_image_path = remote_target.resolve()
+        dashboard.set_visual_buffer_image(remote_target, source="Remote")
+        dashboard.append_system("Remote diagram loaded into Media Drawer.", style="bold cyan")
+        self.notify("Remote image loaded", title="Visual Buffer", severity="information")
 
     def _try_dashboard(self) -> MainDashboard | None:
         """Return MainDashboard from active screen or stack, if present."""
@@ -993,6 +1063,16 @@ class CerealKillerApp(App[None]):
             return
 
         dashboard = self._dashboard()
+        try:
+            await self._with_worker_cancellation(self._cve_jit_body(text, dashboard))
+        except Exception:
+            pass
+
+    async def _cve_jit_body(self, text: str, dashboard) -> None:
+        """Extract CVE IDs and fetch details for each."""
+        cve_ids = extract_cve_ids(text)
+        if not cve_ids:
+            return
 
         def _warn(message: str) -> None:
             dashboard.append_system(message, style="bold red")
@@ -1033,6 +1113,43 @@ class CerealKillerApp(App[None]):
             return self._dashboard().query_one("#easy_button", PulsingEasyButton)
         except (RuntimeError, NoMatches):
             return None
+
+    def _register_worker(self, name: str, task: asyncio.Task[None]) -> None:
+        """Register a worker task for tracking/cancellation."""
+        self._active_workers[name] = task
+
+    def _cancel_worker(self, name: str) -> None:
+        """Cancel a specific worker by name."""
+        if name in self._active_workers:
+            task = self._active_workers[name]
+            if not task.done():
+                task.cancel()
+            self._active_workers.pop(name, None)
+
+    def cancel_all_workers(self) -> None:
+        """Cancel all pending workers to prevent race conditions."""
+        for name, task in list(self._active_workers.items()):
+            if not task.done():
+                task.cancel()
+        self._active_workers.clear()
+
+    def _unregister_worker(self, name: str) -> None:
+        """Unregister a completed worker."""
+        self._active_workers.pop(name, None)
+
+    async def _with_worker_cancellation(self, coro: Any) -> Any:
+        """Cancel all existing workers before running the given coroutine.
+
+        Prevents race conditions when multiple @work workers share
+        chat_transcript / history_context.
+        """
+        for name, task in list(self._active_workers.items()):
+            if not task.done():
+                task.cancel()
+        try:
+            return await coro
+        except asyncio.CancelledError:
+            raise
 
     async def _apply_command_result(self, result: CommandResult) -> None:
         dashboard = self._dashboard()

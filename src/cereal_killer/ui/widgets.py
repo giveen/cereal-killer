@@ -70,6 +70,11 @@ class CommandInput(TextArea):
             self.value = value
             super().__init__()
 
+        @property
+        def control(self) -> "CommandInput":
+            """Alias for compat with Textual's @on decorator."""
+            return self.input
+
     def __init__(self) -> None:
         super().__init__(text="", id="command_input")
         self.border_title = "Prompt (Enter=new line, Ctrl+Enter=send)"

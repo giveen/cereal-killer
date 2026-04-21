@@ -508,6 +508,10 @@ class MainDashboard(Screen[None]):
         main_row.styles.opacity = 0.92
         main_row.styles.animate("opacity", 1.0, duration=0.16)
 
+        # Cancel pending workers from other views to prevent race conditions
+        if hasattr(self.app, "cancel_all_workers"):
+            self.app.cancel_all_workers()
+
     @on(Button.Pressed, "#tab_gibson")
     def show_gibson_view(self) -> None:
         self.set_active_view("gibson")
