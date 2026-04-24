@@ -38,6 +38,9 @@ PY
 # Set ownership of /app to the non-root user
 RUN chown -R ${USER_ID}:${GROUP_ID} /app
 
+# Ensure the logs directory exists and is writable by the non-root user.
+RUN mkdir -p /app/logs && chown ${USER_ID}:${GROUP_ID} /app/logs
+
 USER appuser
 
 CMD ["cereal-killer"]

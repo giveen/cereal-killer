@@ -160,6 +160,7 @@ Use environment variables (from `.env` in Docker or your shell locally):
 - `HISTORY_PATH` (default auto-detect; fallback `~/.bash_history`) — shell history file watched by Terminal Link
 - `GIBSON_SKIP_ENV_CHECK` (default `0`) — set `1` to bypass local setup validation when running against remote infra
 - `RAG_TIMEOUT` (default `10`) — seconds before tiered RAG search times out and returns partial results
+- `EMBEDDING_MODEL` (default `nomic-embed-text-v1.5`) — HuggingFace model for semantic embeddings (used by RAG vector search). Set to `sentence-transformers/all-MiniLM-L6-v2` for a smaller/fallback model.
 
 Docker compose also sets:
 
@@ -227,10 +228,16 @@ Useful slash commands:
 
 Keyboard shortcuts:
 
-- `Ctrl+C`: quit
-- `Ctrl+T`: toggle thinking panel
-- `Ctrl+B`: Easy button pulse
-- `U`: toggle screenshot upload panel
+- `q`: quit
+- `F1`: Chat view
+- `F2`: Ops view
+- `F3`: Gibson (RAG search) view
+- `s`: Sync all knowledge sources
+- `Ctrl+B`: Toggle sidebar
+- `Ctrl+U`: Toggle upload tree panel
+- `Ctrl+T`: Toggle thought stream panel
+- `Ctrl+Enter`: Send command (from input)
+- `Ctrl+V`: Paste from clipboard (input)
 
 ### Screenshot Upload Workflow
 
@@ -405,6 +412,8 @@ Core Python dependencies (from `pyproject.toml`):
 - `pyautogui`
 - `mss`
 - `pyyaml`
+- `sentence-transformers` — Semantic embedding model pipeline
+- `torch` — CPU tensor runtime for sentence-transformers
 
 Docker services:
 
@@ -556,6 +565,7 @@ Key environment variables:
 - `PRESERVE_THINKING` - Enable thinking buffer persistence
 - `BACKEND_TRACE_ENABLED` - Enable LLM request/response tracing
 - `HISTORY_PATH` - Shell history file to observe
+- `EMBEDDING_MODEL` - Embedding model for RAG vector search (set to `nomic-embed-text-v1.5` for best semantic matching)
 
 ## Contributing
 

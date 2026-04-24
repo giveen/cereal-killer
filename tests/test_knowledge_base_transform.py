@@ -3,9 +3,9 @@ import unittest
 from cereal_killer.knowledge_base import transform_dataset
 
 
-class KnowledgeBaseTransformTests(unittest.TestCase):
-    def test_transform_uses_line_video_timestamp_fields(self) -> None:
-        docs = transform_dataset(
+class KnowledgeBaseTransformTests(unittest.IsolatedAsyncioTestCase):
+    async def test_transform_uses_line_video_timestamp_fields(self) -> None:
+        docs = await transform_dataset(
             [
                 {
                     "machine": "HackTheBox - Cap",

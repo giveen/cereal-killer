@@ -1,5 +1,6 @@
 import unittest
 
+from cereal_killer.config import Settings
 from cereal_killer.observer import (
     detect_feedback_signal,
     filter_context_commands,
@@ -7,6 +8,9 @@ from cereal_killer.observer import (
     needs_structured_output_hint,
     parse_history_lines,
 )
+
+# Default settings instance for is_technical_command tests
+_default_settings = Settings()
 
 
 class ObserverTests(unittest.TestCase):
@@ -29,9 +33,9 @@ class ObserverTests(unittest.TestCase):
         self.assertEqual(filter_context_commands(commands, "/tmp/project"), commands)
 
     def test_detects_technical_tool_commands(self) -> None:
-        self.assertTrue(is_technical_command("nmap -sV 10.10.10.10"))
-        self.assertTrue(is_technical_command("sudo gobuster dir -u http://target"))
-        self.assertFalse(is_technical_command("echo hello"))
+        self.assertTrue(is_technical_command("nmap -sV 10.10.10.10", settings=_default_settings))
+        self.assertTrue(is_technical_command("sudo gobuster dir -u http://target", settings=_default_settings))
+        self.assertFalse(is_technical_command("echo hello", settings=_default_settings))
 
     def test_detects_failure_feedback_signal(self) -> None:
         self.assertEqual(detect_feedback_signal("[-] Access denied for share"), "failure")

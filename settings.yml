@@ -1,0 +1,41 @@
+# SearXNG settings for Cereal-Killer
+# Minimal configuration — enables JSON output format so the web_search tool
+# can parse results without HTML scraping.
+
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "Cereal-Killer Search"
+
+server:
+  bind_address: "0.0.0.0"
+  port: 8080
+  secret_key: "${SEARXNG_SECRET}"
+
+search:
+  formats:
+    - html
+    - json
+
+engines:
+  - name: wikidata
+    engine: wikidata
+    shortcut: wd
+    disabled: true
+
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+
+  - name: bing
+    engine: bing
+    shortcut: bi
+
+  - name: google
+    engine: google
+    shortcut: g
+
+outgoing:
+  request_timeout: 10.0
+  max_request_timeout: 20.0

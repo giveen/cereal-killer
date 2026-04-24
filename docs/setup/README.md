@@ -19,6 +19,28 @@ docker --version
 docker compose version
 ```
 
+### Embedding Model (Required for RAG)
+
+This project uses an embedding model for semantic search in the RAG pipeline. The embedding model converts user queries into vector embeddings that RedisVL uses for similarity matching against the knowledge base.
+
+**Required environment variable:**
+
+```bash
+EMBEDDING_MODEL=nomic-embed-text-v1.5
+```
+
+**Why an embedding model is crucial:**
+- Without it, vector search falls back to hash-based embeddings (purely lexical)
+- With a proper embedding model (e.g., nomic-embed-text), queries like "privilege escalation" find the same HackTricks pages as "sudo -l output" because they share semantic meaning
+- The embedding model is the foundation of all semantic retrieval — it's as important as the LLM itself for contextual awareness
+
+**Recommended models:**
+- `nomic-embed-text-v1.5` — Best overall (768-dim, fast, high-quality)
+- `sentence-transformers/all-MiniLM-L6-v2` — Smaller/faster fallback
+- `sentence-transformers/all-mpnet-base-v2` — Higher quality but larger
+
+The embedding model is downloaded lazily on first use (first RAG query). It is cached globally after that.
+
 ## 2. Local Model Layout
 
 Create a model directory that contains:

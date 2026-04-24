@@ -3,8 +3,8 @@ import unittest
 from mentor.kb.query import RAGSnippet, _canonical_machine, _summarize_snippet, retrieve_reference_material
 
 
-class QueryPrioritizationTests(unittest.TestCase):
-    def test_prioritizes_target_machine_results(self) -> None:
+class QueryPrioritizationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prioritizes_target_machine_results(self) -> None:
         snippets = [
             RAGSnippet(source="ippsec", machine="monitor", title="m", url="u", content="c", score=0.01),
             RAGSnippet(source="ippsec", machine="HackTheBox - Cap", title="c", url="u", content="c", score=0.20),
@@ -15,13 +15,13 @@ class QueryPrioritizationTests(unittest.TestCase):
         # query path with pre-cooked snippets.
         import mentor.kb.query as q
 
-        def fake_query_single_index(settings, index_name, query, limit, machine_filter=None):  # type: ignore[no-untyped-def]
+        async def fake_query_single_index(settings, index_name, query, limit, machine_filter=None, precomputed_vector=None, **kwargs):  # type: ignore[no-untyped-def]
             return snippets
 
         original = q._query_single_index
         q._query_single_index = fake_query_single_index  # type: ignore[assignment]
         try:
-            result = retrieve_reference_material(
+            result = await retrieve_reference_material(
                 settings=type("S", (), {"redis_index": "ippsec", "redis_url": "redis://localhost:6379"})(),
                 command_or_prompt="command injection",
                 context_commands=[],

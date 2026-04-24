@@ -166,7 +166,7 @@ class TestTieredSearch(unittest.TestCase):
             RAGSnippet("ippsec", "lame", "T", "http://u", "content", score=0.1)  # similarity 0.9
         ]
         async def run():
-            with patch("mentor.engine.search_orchestrator.retrieve_reference_material", return_value=good_snippets), \
+            with patch("mentor.engine.search_orchestrator.retrieve_reference_material", new_callable=AsyncMock, return_value=good_snippets), \
                  patch("mentor.engine.search_orchestrator.web_search") as mock_ws:
                 result = await tiered_search("nmap results", self._settings(), vector_threshold=0.7)
                 mock_ws.assert_not_called()
@@ -183,7 +183,7 @@ class TestTieredSearch(unittest.TestCase):
         web_results = [WebResult("WR", "https://wr.com", "snippet")]
 
         async def run():
-            with patch("mentor.engine.search_orchestrator.retrieve_reference_material", return_value=poor_snippets), \
+            with patch("mentor.engine.search_orchestrator.retrieve_reference_material", new_callable=AsyncMock, return_value=poor_snippets), \
                  patch("mentor.engine.search_orchestrator.web_search", AsyncMock(return_value=web_results)):
                 return await tiered_search("obscure CVE", self._settings(), vector_threshold=0.7)
 
@@ -198,7 +198,7 @@ class TestTieredSearch(unittest.TestCase):
         web_results = [WebResult("WR", "https://wr.com", "snippet")]
 
         async def run():
-            with patch("mentor.engine.search_orchestrator.retrieve_reference_material", return_value=good_snippets), \
+            with patch("mentor.engine.search_orchestrator.retrieve_reference_material", new_callable=AsyncMock, return_value=good_snippets), \
                  patch("mentor.engine.search_orchestrator.web_search", AsyncMock(return_value=web_results)):
                 return await tiered_search("anything", self._settings(), force_web=True)
 
@@ -212,7 +212,7 @@ class TestTieredSearch(unittest.TestCase):
 
         async def run():
             settings = Settings(redis_url="redis://localhost:59999", searxng_base_url="")
-            with patch("mentor.engine.search_orchestrator.retrieve_reference_material", return_value=poor_snippets), \
+            with patch("mentor.engine.search_orchestrator.retrieve_reference_material", new_callable=AsyncMock, return_value=poor_snippets), \
                  patch("mentor.engine.search_orchestrator.web_search") as mock_ws:
                 result = await tiered_search("query", settings, vector_threshold=0.7)
                 mock_ws.assert_not_called()
@@ -226,7 +226,7 @@ class TestTieredSearch(unittest.TestCase):
         web_results = [WebResult("Title", "https://t.com", "snippet text")]
 
         async def run():
-            with patch("mentor.engine.search_orchestrator.retrieve_reference_material", return_value=poor_snippets), \
+            with patch("mentor.engine.search_orchestrator.retrieve_reference_material", new_callable=AsyncMock, return_value=poor_snippets), \
                  patch("mentor.engine.search_orchestrator.web_search", AsyncMock(return_value=web_results)):
                 return await tiered_search("query", self._settings(), vector_threshold=0.7)
 
@@ -240,7 +240,7 @@ class TestTieredSearch(unittest.TestCase):
             RAGSnippet("ippsec", "lame", "T", "http://u", "content", score=0.1)
         ]
         async def run():
-            with patch("mentor.engine.search_orchestrator.retrieve_reference_material", return_value=quick_snippets), \
+            with patch("mentor.engine.search_orchestrator.retrieve_reference_material", new_callable=AsyncMock, return_value=quick_snippets), \
                  patch("mentor.engine.search_orchestrator.web_search") as mock_ws:
                 # timeout=60 should be enough for mocked search to complete
                 result = await tiered_search("test", self._settings(), rag_timeout=60)
@@ -258,8 +258,8 @@ class TestTieredSearch(unittest.TestCase):
             async def slow_web_search(*args, **kwargs):
                 await asyncio.sleep(5)  # longer than timeout
                 return [WebResult("WR", "https://wr.com", "snippet")]
-            
-            with patch("mentor.engine.search_orchestrator.retrieve_reference_material", return_value=partial_snippets), \
+
+            with patch("mentor.engine.search_orchestrator.retrieve_reference_material", new_callable=AsyncMock, return_value=partial_snippets), \
                  patch("mentor.engine.search_orchestrator.web_search", side_effect=slow_web_search), \
                  patch("mentor.engine.search_orchestrator._best_vector_score", return_value=0.3):  # below threshold
                 result = await tiered_search("slow query", self._settings(), rag_timeout=0.1)
@@ -277,8 +277,8 @@ class TestTieredSearch(unittest.TestCase):
                 # This is the slow call inside _run_pipeline that gets wrapped by wait_for
                 await asyncio.sleep(5)
                 return []
-            
-            with patch("mentor.engine.search_orchestrator.retrieve_reference_material", return_value=partial_snippets), \
+
+            with patch("mentor.engine.search_orchestrator.retrieve_reference_material", new_callable=AsyncMock, return_value=partial_snippets), \
                  patch("mentor.engine.search_orchestrator.web_search", side_effect=fast_web_search_then_timeout), \
                  patch("mentor.engine.search_orchestrator._best_vector_score", return_value=0.3):  # below threshold
                 result = await tiered_search("partial query", self._settings(), rag_timeout=0.1)
