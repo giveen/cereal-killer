@@ -7,8 +7,9 @@ from pathlib import Path
 
 from textual.containers import Horizontal, Vertical
 from textual import on
+from textual.app import ComposeResult
 from textual.message import Message
-from textual.widgets import Button, Collapsible, Input, Markdown, Static
+from textual.widgets import Button, Collapsible, Input, LoadingIndicator, Markdown, Static
 from textual.widgets import TextArea
 
 try:
@@ -329,6 +330,12 @@ class SidebarStatus(Vertical):
         super().__init__(id="intel_sidebar", **kwargs)
         self._terminal_link_online = True
 
+    @on(Button.Pressed, "#settings_button")
+    def _open_settings(self) -> None:
+        """Open the settings modal by dispatching an event to the app."""
+        # The event will bubble up to the app's handler
+        pass
+
     def compose(self):
         from .widgets_findings import FindingsWidget
 
@@ -344,6 +351,8 @@ class SidebarStatus(Vertical):
             yield Static("CACHE: [yellow]COLD[/yellow]", id="llm_cache_status", classes="ops-stat")
             yield Static("|", classes="ops-sep")
             yield Button("SETUP: CHECKING", id="system_readiness_tag", variant="default")
+            yield Static("|", classes="ops-sep")
+            yield Button("[⚙ SETTINGS]", id="settings_button", variant="default")
         with Horizontal(id="ops_bottom_row"):
             yield Static("", id="ops_spacer")
             with Vertical(id="ops_media_column"):
@@ -478,3 +487,32 @@ class SidebarStatus(Vertical):
         self.query_one("#upload_progress_label", Static).update(f"{label}\n{progress}%")
         self.query_one("#upload_progress_bar", VerticalProgressBar).set_value(progress)
         self.query_one("#upload_progress_value", Static).update(f"{progress}%")
+
+
+class StreamingIndicator(Static):
+    """Animated cursor that pulses while streaming is active."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(id="streaming_indicator", classes="streaming-indicator", **kwargs)
+        self._visible = False
+        self._pulsing = False
+
+    def compose(self) -> ComposeResult:
+        yield LoadingIndicator(id="streaming_loader")
+
+    def start(self) -> None:
+        """Show the streaming indicator."""
+        self._visible = True
+        self.visible = True
+        self.add_class("streaming")
+
+    def stop(self) -> None:
+        """Hide the streaming indicator."""
+        self._visible = False
+        self.visible = False
+        self.remove_class("streaming")
+
+    @property
+    def visible_indicator(self) -> bool:
+        """Whether the indicator is currently visible."""
+        return self._visible

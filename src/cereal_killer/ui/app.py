@@ -1,63 +1,43 @@
 from __future__ import annotations
 
 import asyncio
-import difflib
-import json
 import re
-import shutil
-import subprocess
-import sys
 import time as _time
-from datetime import UTC, datetime
 from typing import Any
-from io import BytesIO
 from pathlib import Path
-from urllib.parse import urlparse
 
 from textual import on, work
 from textual.app import App
 from textual.css.query import NoMatches
 from textual.events import Resize
 from textual.widgets import Button, DirectoryTree, Input, Markdown, OptionList
-
-import httpx
-
 from cereal_killer.context_manager import ContextManager
+from cereal_killer.context_per_box import ContextPerBox
 from cereal_killer.engine import LLMEngine
-from cereal_killer.ingest_logic import build_document_prompt, is_document_path, is_image_path
-from cereal_killer.kb.cve_jit import extract_cve_ids, fetch_cve, get_rate_snapshot
 from cereal_killer.knowledge_base import KnowledgeBase
 from cereal_killer.observer import (
     ClipboardImageDetected,
     ClipboardImageWatcher,
-    ascii_preview_for_image,
-    clear_clipboard_buffer,
-    observe_history_events,
 )
-from mentor.engine.commands import CommandResult, dispatch as dispatch_command
-from mentor.engine.methodology import audit_command as audit_methodology
-from mentor.engine.search_orchestrator import tiered_search
-from mentor.kb.library_ingest import fetch_sync_status
-from mentor.kb.query import retrieve_solution_for_machine
-from mentor.ui.phase import detect_phase
+from cereal_killer.ui.commands import CommandHandler
+from mentor.engine.commands import CommandResult
 from mentor.ui.startup import run_boot_sequence
 
-from .screens import InfrastructureCriticalModal, IngestModal, IngestSelection, MainDashboard, SolutionModal
-from .tabs.ops import check_system_readiness
+from .base import resolve_dashboard, require_dashboard
+from .screens import InfrastructureCriticalModal, IngestModal, IngestSelection, MainDashboard, SettingsScreen, SolutionModal
 from .widgets import PulsingEasyButton
 from .widgets import CommandInput
-
-
-_AUTO_COACH_COOLDOWN_SECS = 10
-CODE_BLOCK_PATTERN = re.compile(r"```(?:[a-zA-Z0-9_+-]+)?\n(.*?)```", re.DOTALL)
-SEARCH_SOURCE_FILTER_RE = re.compile(r"\bonly\s+(ippsec|gtfobins|lolbas|hacktricks|payloads)\b", re.IGNORECASE)
-IMAGE_URL_RE = re.compile(r"https?://[^\s\]\)>'\"]+\.(?:png|jpg|jpeg|webp|bmp|gif)(?:\?[^\s\]\)>'\"]*)?", re.IGNORECASE)
-VISION_BUFFER_PATH = Path("data/temp/clipboard_obs.png")
-VISION_PROMPT = (
-    "Zero Cool, I've just pasted a screenshot. "
-    "Look at the error/output and tell me where I'm failing."
-)
-_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+from .workers.vision_workers import VISION_BUFFER_PATH
+from cereal_killer.ui.workers.vision_workers import VisionWorkerManager
+from cereal_killer.ui.workers.search_workers import SearchWorkerManager
+from cereal_killer.ui.workers.ingest_workers import IngestWorkerManager
+from cereal_killer.ui.workers.chat_workers import ChatWorkerManager
+from cereal_killer.ui.workers.worker_lifecycle import WorkerLifecycleManager
+from cereal_killer.ui.workers.misc_workers import MiscWorkerManager
+from cereal_killer.ui.context.context_state import ContextStateManager
+from cereal_killer.ui.sessions.session_manager import SessionManager
+from cereal_killer.ui.observers.terminal_observer import TerminalObserver
+from cereal_killer.ui.cve.cve_jit import CVEJIT
 
 
 class CerealKillerApp(App[None]):
@@ -66,10 +46,11 @@ class CerealKillerApp(App[None]):
         ("q", "quit", "Quit"),
         ("f1", "show_chat_view", "Chat"),
         ("f2", "show_ops_view", "Ops"),
-        ("f3", "focus_gibson", "Gibson"),
-        ("s", "sync_all", "Sync"),
+        ("f3", "show_gibson_view", "Gibson"),
+        ("s", "action_sync_all", "Sync"),
         ("ctrl+b", "toggle_sidebar", "Sidebar"),
-        ("ctrl+u", "open_upload_modal", "Upload"),
+        ("ctrl+u", "action_toggle_upload_tree", "Upload"),
+        ("ctrl+t", "toggle_thought_stream", "Thought"),
     ]
 
     def __init__(
@@ -84,7 +65,6 @@ class CerealKillerApp(App[None]):
         self.kb = kb
         self.title = "CEREAL KILLER"
         self.sub_title = "TARGET: NONE"
-        self.history_context: list[str] = []
         self.observer_task: asyncio.Task[None] | None = None
         self.clipboard_task: asyncio.Task[None] | None = None
         self.clipboard_watcher = ClipboardImageWatcher(output_path=VISION_BUFFER_PATH)
@@ -92,7 +72,6 @@ class CerealKillerApp(App[None]):
         self.pathetic_meter = 0
         self.easy_usage_count = 0
         self.successful_command_count = 0
-        self.chat_transcript: list[dict[str, str]] = []
         self._context_manager = ContextManager()
         self.current_target: str = ""
         self._pruning_in_flight = False
@@ -104,12 +83,37 @@ class CerealKillerApp(App[None]):
         self._vision_analyzed_sources: set[str] = set()
         self._preflight_hard_fail = preflight_hard_fail
         self._preflight_reason = preflight_reason
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
-    def _dashboard(self) -> MainDashboard:
-        screen = self.screen
-        if not isinstance(screen, MainDashboard):
-            raise RuntimeError("MainDashboard is not active")
-        return screen
+        self._vision_manager = VisionWorkerManager(self)
+        self._search_manager = SearchWorkerManager(self)
+        self._ingest_manager = IngestWorkerManager(self)
+        self._chat_manager = ChatWorkerManager(self)
+        self._lifecycle_manager = WorkerLifecycleManager(self)
+        self._misc_manager = MiscWorkerManager(self)
+        self._context_manager_instance = ContextStateManager(self)
+        self._session_manager = SessionManager(self)
+        self._context_per_box = ContextPerBox(self.engine.settings)
+        self._observer = TerminalObserver(self)
+        self._cve_jit = CVEJIT(self)
+        self._command_handler = CommandHandler(self)
+
+    @property
+    def active_history(self) -> list[str]:
+        """Get the active machine's command history (per-box isolated)."""
+        return self._context_per_box.get_active_history()
+
+    @property
+    def active_transcript(self) -> list[dict[str, str]]:
+        """Get the active machine's chat transcript (per-box isolated)."""
+        return self._context_per_box.get_active_transcript()
+
+    @property
+    def context_per_box(self) -> ContextPerBox:
+        """Access the context-per-box manager."""
+        return self._context_per_box
+
+    _dashboard = require_dashboard
 
     async def on_mount(self) -> None:
         await self.push_screen(MainDashboard())
@@ -123,19 +127,20 @@ class CerealKillerApp(App[None]):
         self.set_interval(0.7, self._pulse_easy_button)
         self.set_interval(300, self._schedule_persist_mental_state)
         self.set_interval(60, self._schedule_context_prune)
-        self.set_interval(60, self._refresh_knowledge_sync_status)
-        self.set_interval(15, self._refresh_github_api_status)
+        self.set_interval(60, self._observer.update_knowledge_sync_status)
+        self.set_interval(15, self._observer.update_github_api_status)
         self.observer_task = asyncio.create_task(self._observe())
         self.clipboard_task = asyncio.create_task(self._watch_clipboard())
-        asyncio.create_task(self._run_boot_sequence())
-        self._refresh_knowledge_sync_status()
-        self._refresh_github_api_status()
-        asyncio.create_task(self._run_system_readiness_check())
+        self._spawn_background_task(self._run_boot_sequence())
+        self._observer.update_knowledge_sync_status()
+        self._observer.update_github_api_status()
+        self._spawn_background_task(self._observer.run_system_readiness_check())
         if self._preflight_hard_fail:
             dashboard.set_active_view("ops")
             self.push_screen(InfrastructureCriticalModal(self._preflight_reason))
         if hasattr(self.engine, "set_web_search_callback"):
-            self.engine.set_web_search_callback(self._on_web_search_state)
+            self.engine.set_web_search_callback(self._observer.set_web_search_state)
+        self.set_active_machine(Path.cwd().name)
         self._update_context_token_counter()
 
     async def on_unmount(self) -> None:
@@ -143,10 +148,13 @@ class CerealKillerApp(App[None]):
             self.observer_task.cancel()
         if self.clipboard_task:
             self.clipboard_task.cancel()
+        for task in list(self._background_tasks):
+            task.cancel()
+        self._background_tasks.clear()
         # Cancel all pending workers
         self.cancel_all_workers()
         if hasattr(self.engine, "persist_mental_state"):
-            await self.engine.persist_mental_state(self.history_context)
+            await self.engine.persist_mental_state(self.active_history)
         self._save_session_snapshot("app-close")
 
     def on_resize(self, event: Resize) -> None:
@@ -166,6 +174,8 @@ class CerealKillerApp(App[None]):
         if prompt.startswith("/"):
             dashboard.set_active_tool("CommandProcessor")
             asyncio.create_task(self._handle_command(prompt))
+        elif self.engine.settings.enable_streaming:
+            self._run_stream_chat_worker(prompt)
         else:
             self._run_chat_worker(prompt)
 
@@ -216,26 +226,7 @@ class CerealKillerApp(App[None]):
         asyncio.create_task(self._refresh_gibson_thinking_buffer())
 
     async def _refresh_gibson_thinking_buffer(self) -> None:
-        if not hasattr(self.engine, "get_thinking_buffer"):
-            return
-
-        machine_name = self.current_target or Path.cwd().name
-        try:
-            thought_buffer = await self.engine.get_thinking_buffer(machine_name, max_chars=8000)
-        except Exception:
-            return
-        if not thought_buffer.strip():
-            return
-
-        dashboard = self._try_dashboard()
-        if dashboard is None or self._gibson_snippets:
-            return
-
-        dashboard.query_one("#gibson_viewer", Markdown).update(
-            "# SESSION THOUGHT BUFFER\n\n"
-            "(Stored locally in Redis and excluded from normal next-turn prompt context unless requested.)\n\n"
-            f"```text\n{thought_buffer.strip()}\n```"
-        )
+        self._misc_manager.refresh_gibson_thinking_buffer()
 
     @on(Button.Pressed, "#system_readiness_tag")
     def on_system_readiness_tag_pressed(self) -> None:
@@ -253,6 +244,20 @@ class CerealKillerApp(App[None]):
             return
         dashboard.query_one("#gibson_viewer", Markdown).update(markdown)
         self.notify("Opened setup guide in Gibson tab", title="Setup", severity="information")
+
+    @on(Button.Pressed, "#settings_button")
+    def on_settings_button_pressed(self) -> None:
+        """Open the settings modal when the settings button is pressed."""
+        self.push_screen(SettingsScreen(self.kb.settings, self), lambda result: self._on_settings_result(result))
+
+    def _on_settings_result(self, result: bool | None) -> None:
+        """Handle the result from the settings modal."""
+        if result:
+            self.notify("Settings updated successfully.", title="Settings", severity="information")
+        elif result is False:
+            self.notify("Settings cancelled.", title="Settings", severity="warning")
+        else:
+            self.notify("Settings modal dismissed.", title="Settings", severity="warning")
 
     def queue_remote_visual_url(self, url: str) -> None:
         """Handle inline Gibson [VIEW IMAGE] links."""
@@ -311,111 +316,26 @@ class CerealKillerApp(App[None]):
         self._run_vision_worker(str(image_path), source_label="Visual Buffer")
 
     async def _handle_command(self, prompt: str) -> None:
-        dashboard = self._dashboard()
-        result = await dispatch_command(prompt, self.engine, self.kb.settings)
-        if result is None:
-            self._run_chat_worker(prompt)
-            return
-
-        await self._apply_command_result(result)
-        if result.session_prefix == "__exit__":
-            self.exit()
-            return
-        if result.session_prefix == "__loot__":
-            self._run_loot_worker()
-            return
-        if result.session_prefix == "__vision__":
-            self._run_vision_worker(str(VISION_BUFFER_PATH), source_label="Clipboard")
-            return
-        if result.session_prefix == "__upload__":
-            if result.upload_image_path:
-                upload_path = Path(result.upload_image_path)
-                self._prime_uploaded_image(upload_path, source="/upload")
-                self._run_vision_worker(str(upload_path), source_label="/upload")
-            else:
-                dashboard.append_system("Upload command did not provide a path.", style="red")
-            return
-        if result.session_prefix == "__search__":
-            if result.search_query:
-                self._run_search_worker(result.search_query)
-            else:
-                dashboard.append_system("Search command did not provide a query.", style="red")
-            return
-        if result.session_prefix == "__sync_all__":
-            self.notify("Sync-all launched. Knowledge bar will update after ingest.", title="Sync Status", severity="information")
-            self._refresh_knowledge_sync_status()
-            return
-        if result.session_prefix == "__add_source__":
-            if result.search_query:
-                self.notify(
-                    f"Crawling {result.search_query[:60]}...",
-                    title="Add Source",
-                    severity="information",
-                )
-                if self._looks_like_image_url(result.search_query):
-                    dashboard.set_remote_image_candidate(result.search_query)
-                    dashboard.append_system(
-                        "Crawl source includes an image. Use [VIEW IMAGE] in the Media Drawer.",
-                        style="bold cyan",
-                    )
-            return
-
-        dashboard.set_active_tool("Idle")
+        """Route slash commands through the CommandHandler."""
+        await self._command_handler.handle_command(prompt)
 
     @work(exclusive=True, thread=False, group="llm")
     async def _run_chat_worker(self, prompt: str) -> None:
-        dashboard = self._dashboard()
-        worker_name = self.__class__.__name__ + "." + sys._getframe().f_code.co_name.replace("_run_", "", 1)
-        self._register_worker(worker_name, asyncio.current_task())
-        self._analysis_busy(True)
-        dashboard.set_active_tool("Brain")
-        try:
-            await self._with_worker_cancellation(self._chat_body(prompt))
-        except Exception as exc:
-            dashboard.append_system(f"LLM error: {exc}", style="red")
-        finally:
-            dashboard.set_active_tool("Idle")
-            self._analysis_busy(False)
-            self._unregister_worker(worker_name)
+        await self._chat_manager.run_chat_worker(prompt)
+
+    @work(exclusive=True, thread=False, group="llm")
+    async def _run_stream_chat_worker(self, prompt: str) -> None:
+        await self._chat_manager.run_stream_chat_worker(prompt)
 
     async def _chat_body(self, prompt: str) -> None:
-        response = await self.engine.chat(
-            prompt,
-            self.history_context,
-            pathetic_meter=self.pathetic_meter,
-        )
-        self._update_llm_cache_metrics(response.backend_meta)
-        await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
-        phase = detect_phase(self.history_context)
-        self._dashboard().set_phase(phase)
-        if "pwned" in prompt.lower() or "owned" in prompt.lower():
-            self._save_session_snapshot("pwned-manual")
+        await self._chat_manager.chat_body(prompt)
 
     @work(exclusive=True, thread=False, group="llm")
     async def _run_loot_worker(self) -> None:
-        dashboard = self._dashboard()
-        worker_name = self.__class__.__name__ + "." + sys._getframe().f_code.co_name.replace("_run_", "", 1)
-        self._register_worker(worker_name, asyncio.current_task())
-        machine_name = Path.cwd().name
-        self._analysis_busy(True)
-        dashboard.set_active_tool("Loot")
-        dashboard.append_system(f"Generating loot report for {machine_name}...", style="bold green")
-        try:
-            await self._with_worker_cancellation(self._loot_body())
-        except Exception as exc:
-            dashboard.append_system(f"Loot report error: {exc}", style="red")
-        finally:
-            dashboard.set_active_tool("Idle")
-            self._analysis_busy(False)
-            self._unregister_worker(worker_name)
+        await self._chat_manager.run_loot_worker()
 
     async def _loot_body(self) -> None:
-        response = await self.engine.generate_loot_report(
-            history_commands=self.history_context,
-            pathetic_meter=self.pathetic_meter,
-        )
-        self._update_llm_cache_metrics(response.backend_meta)
-        await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
+        await self._chat_manager.loot_body()
 
     @work(exclusive=True, thread=False, group="llm")
     async def _run_vision_worker(
@@ -424,393 +344,67 @@ class CerealKillerApp(App[None]):
         source_label: str = "Clipboard",
         mark_context: bool = False,
     ) -> None:
-        dashboard = self._dashboard()
-        worker_name = self.__class__.__name__ + "." + sys._getframe().f_code.co_name.replace("_run_", "", 1)
-        self._register_worker(worker_name, asyncio.current_task())
-        image_file = Path(image_path)
-        if not image_file.exists():
-            dashboard.append_system(f"Vision input missing: {image_file}", style="yellow")
-            return
-
-        self._analysis_busy(True)
-        dashboard.set_active_tool("Vision")
-        if mark_context:
-            dashboard.set_upload_progress(25, "IMAGE INGEST")
-            dashboard.set_context_chip(image_file.name, ingest_type="image")
-        dashboard.append_system(f"Image Uploaded: {image_file.name} ({source_label})", style="bold cyan")
-        dashboard.append_system(f"Zero Cool is analyzing {image_file.name}...", style="bold green")
-        try:
-            await self._with_worker_cancellation(self._vision_body(str(image_file), mark_context))
-        except Exception as exc:
-            dashboard.append_system(f"Vision analysis error: {exc}", style="red")
-            if mark_context:
-                dashboard.set_upload_progress(0, "IMAGE INGEST")
-        finally:
-            dashboard.set_active_tool("Idle")
-            self._analysis_busy(False)
-            self._unregister_worker(worker_name)
+        await self._vision_manager.run_vision_worker(image_path, source_label, mark_context)
 
     async def _vision_body(self, image_path: str, mark_context: bool) -> None:
-        image_file = Path(image_path)
-        response = await self.engine.chat_with_image(
-            user_prompt=VISION_PROMPT,
-            image_path=str(image_file),
-            history_commands=self.history_context,
-            pathetic_meter=self.pathetic_meter,
-        )
-        self._update_llm_cache_metrics(response.backend_meta)
-        await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
-        self._vision_analyzed_sources.add(str(image_file.expanduser().resolve()))
-        dashboard = self._try_dashboard()
-        if dashboard and mark_context:
-            dashboard.set_upload_progress(100, "IMAGE INGEST")
+        await self._vision_manager.vision_body(image_path, mark_context)
 
     @work(exclusive=True, thread=False, group="llm")
     async def _run_document_ingest_worker(self, file_path: str) -> None:
-        dashboard = self._dashboard()
-        worker_name = self.__class__.__name__ + "." + sys._getframe().f_code.co_name.replace("_run_", "", 1)
-        self._register_worker(worker_name, asyncio.current_task())
-        path = Path(file_path)
-        if not is_document_path(path):
-            dashboard.append_system(f"Unsupported document type: {path.suffix}", style="yellow")
-            return
-
-        self._analysis_busy(True)
-        dashboard.set_active_tool("Document Ingest")
-        dashboard.set_upload_progress(20, "DOC INGEST")
-        dashboard.set_context_chip(path.name, ingest_type="document")
-        try:
-            await self._with_worker_cancellation(self._doc_ingest_body(str(path)))
-            dashboard.append_system(f"Document Uploaded: {path.name}", style="bold cyan")
-            dashboard.set_upload_progress(100, "DOC INGEST")
-        except json.JSONDecodeError as exc:
-            dashboard.append_system(f"Invalid JSON document: {exc}", style="red")
-            dashboard.set_upload_progress(0, "DOC INGEST")
-        except Exception as exc:
-            dashboard.append_system(f"Document ingest error: {exc}", style="red")
-            dashboard.set_upload_progress(0, "DOC INGEST")
-        finally:
-            dashboard.set_active_tool("Idle")
-            self._analysis_busy(False)
-            self._unregister_worker(worker_name)
+        await self._ingest_manager.run_document_ingest_worker(file_path)
 
     async def _doc_ingest_body(self, path_str: str) -> None:
-        path = Path(path_str)
-        payload = build_document_prompt(path)
-        dashboard = self._try_dashboard()
-        if dashboard:
-            dashboard.set_upload_progress(55, "DOC INGEST")
-        response = await self.engine.chat(
-            payload.prompt,
-            self.history_context,
-            pathetic_meter=self.pathetic_meter,
-        )
-        self._update_llm_cache_metrics(response.backend_meta)
-        await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
+        await self._ingest_manager.doc_ingest_body(path_str)
 
     @work(exclusive=True, thread=False, group="coach")
     async def _run_autocoach_worker(self, command: str) -> None:
-        dashboard = self._dashboard()
-        worker_name = self.__class__.__name__ + "." + sys._getframe().f_code.co_name.replace("_run_", "", 1)
-        self._register_worker(worker_name, asyncio.current_task())
-        self._analysis_busy(True)
-        dashboard.set_active_tool("Brain")
-        try:
-            await self._with_worker_cancellation(self._autocoach_body(command))
-        except Exception as exc:
-            dashboard.append_system(f"Auto-coach error: {exc}", style="red")
-        finally:
-            dashboard.set_active_tool("Idle")
-            self._analysis_busy(False)
-            self._unregister_worker(worker_name)
+        await self._misc_manager.run_autocoach_worker(command)
 
     async def _autocoach_body(self, command: str) -> None:
-        response = await self.engine.react_to_command(
-            command,
-            self.history_context,
-            pathetic_meter=self.pathetic_meter,
-        )
-        self._update_llm_cache_metrics(response.backend_meta)
-        await self._consume_llm_response(response.answer, response.reasoning_content or response.thought)
+        await self._misc_manager.autocoach_body(command)
 
     @work(exclusive=True, thread=False, group="llm")
     async def _run_search_worker(self, query: str) -> None:
-        dashboard = self._dashboard()
-        worker_name = self.__class__.__name__ + "." + sys._getframe().f_code.co_name.replace("_run_", "", 1)
-        self._register_worker(worker_name, asyncio.current_task())
-        self._analysis_busy(True)
-        dashboard.set_active_tool("Search")
-        self.notify(
-            f"Searching local Gibson memory for '{query}'...",
-            title="Search Status",
-            severity="information",
-        )
-        dashboard.append_system(f"Searching local Gibson memory for '{query}'...", style="bold cyan")
-        try:
-            await self._with_worker_cancellation(self._search_body(query))
-        except Exception as exc:
-            dashboard.append_system(f"Search error: {exc}", style="red")
-        finally:
-            dashboard.set_active_tool("Idle")
-            self._analysis_busy(False)
-            self._unregister_worker(worker_name)
+        await self._search_manager.run_search_worker(query)
 
     async def _search_body(self, query: str) -> None:
-        source_filters = self._extract_source_filters(query)
-        search_result = await tiered_search(
-            query=query,
-            settings=self.kb.settings,
-            history_commands=[],
-            target_machine=None,
-            allow_web=False,
-            force_web=False,
-            top_k=12,
-            source_filters=source_filters,
-        )
-        chunks = search_result.vector_snippets
-        top_scores = ", ".join(f"{score:.3f}" for score in search_result.top_similarity_scores) or "none"
-        dashboard = self._try_dashboard()
-        if dashboard:
-            dashboard.append_system(f"RAG top-3 similarity: {top_scores}", style="bold cyan")
-            dashboard.append_system(
-                f"Gibson found {len(chunks)} relevant matches in local memory.",
-                style="bold green",
-            )
-            self.notify(
-                f"Gibson found {len(chunks)} relevant matches in local memory.",
-                title="Search Status",
-                severity="information",
-            )
+        await self._search_manager.search_body(query)
 
-            if chunks:
-                response = await self.engine.synthesize_search_results(query, chunks)
-                self._update_llm_cache_metrics(response.backend_meta)
-                labeled_answer = f"## [SEARCH RESULT]\n\n{response.answer.strip()}"
-                await self._consume_llm_response(labeled_answer, response.reasoning_content or response.thought)
-                dashboard.show_gibson_summary(f"# GIBSON SUMMARY\n\n{response.answer.strip()}")
-            else:
-                fallback = (
-                    f"My local memory for '{query}' is a void. "
-                    "Checking the IppSec and HackTricks datasets again... "
-                    "or perhaps you should learn to type."
-                )
-                dashboard.append_assistant(fallback)
-                self._append_chat("assistant", fallback)
-
-            # Populate Gibson tab with raw snippets and switch to it.
-            self._gibson_snippets = []
-            for snippet in chunks:
-                row = {
-                    "title": snippet.title,
-                    "content": snippet.content,
-                    "source": snippet.source,
-                    "machine": snippet.machine,
-                    "url": snippet.url,
-                }
-                row["visual_image_url"] = self._extract_visual_candidate_url([row])
-                self._gibson_snippets.append(row)
-            remote_candidate = self._extract_visual_candidate_url(self._gibson_snippets)
-            dashboard.set_remote_image_candidate(remote_candidate)
-            if remote_candidate:
-                dashboard.append_system("Relevant diagram found. Use [VIEW IMAGE] in the Media Drawer.", style="bold cyan")
-            dashboard.set_gibson_results(self._gibson_snippets)
-            dashboard.set_active_view("gibson")
-
-    @staticmethod
-    def _extract_source_filters(query: str) -> list[str] | None:
-        match = SEARCH_SOURCE_FILTER_RE.search(query)
-        if not match:
-            return None
-        return [match.group(1).strip().lower()]
+    def _extract_source_filters(self, query: str) -> list[str] | None:
+        """Delegate to search manager for source filter extraction."""
+        return self._search_manager.extract_source_filters(query)
 
     @work(exclusive=False, thread=False, group="search")
     async def _run_gibson_search_worker(self, query: str) -> None:
         """Direct search from the Gibson tab with grouped results + auto summary."""
-        dashboard = self._dashboard()
-        worker_name = self.__class__.__name__ + "." + sys._getframe().f_code.co_name.replace("_run_", "", 1)
-        self._register_worker(worker_name, asyncio.current_task())
-        dashboard.set_gibson_loading(True)
-        dashboard.set_active_tool("Gibson")
-        self._analysis_busy(True)
-        try:
-            await self._with_worker_cancellation(self._gibson_search_body(query))
-        except Exception as exc:
-            try:
-                dashboard.query_one("#gibson_viewer", Markdown).update(f"_Search error: {exc}_")
-            except Exception:
-                pass
-        finally:
-            dashboard.set_active_tool("Idle")
-            dashboard.set_gibson_loading(False)
-            self._analysis_busy(False)
-            self._unregister_worker(worker_name)
+        await self._search_manager.run_gibson_search_worker(query)
 
     async def _gibson_search_body(self, query: str) -> None:
         """Perform tiered search and LLM synthesis for Gibson tab."""
-        dashboard = self._dashboard()
-        source_filters = self._extract_source_filters(query)
-        search_result = await tiered_search(
-            query=query,
-            settings=self.kb.settings,
-            history_commands=[],
-            target_machine=None,
-            allow_web=False,
-            force_web=False,
-            top_k=15,
-            source_filters=source_filters,
-        )
-        top_scores = ", ".join(f"{score:.3f}" for score in search_result.top_similarity_scores) or "none"
-        dashboard.append_system(f"RAG top-3 similarity: {top_scores}", style="bold cyan")
-        dashboard.append_system(
-            f"Gibson found {len(search_result.vector_snippets)} relevant matches in local memory.",
-            style="bold green",
-        )
-        self._gibson_snippets = []
-        for snippet in search_result.vector_snippets:
-            row = {
-                "title": snippet.title,
-                "content": snippet.content,
-                "source": snippet.source,
-                "machine": snippet.machine,
-                "url": snippet.url,
-            }
-            row["visual_image_url"] = self._extract_visual_candidate_url([row])
-            self._gibson_snippets.append(row)
-        remote_candidate = self._extract_visual_candidate_url(self._gibson_snippets)
-        dashboard.set_remote_image_candidate(remote_candidate)
-        if remote_candidate:
-            dashboard.append_system("Relevant diagram found. Use [VIEW IMAGE] in the Media Drawer.", style="bold cyan")
-        dashboard.set_gibson_results(self._gibson_snippets)
-
-        if self._gibson_snippets:
-            from mentor.kb.query import RAGSnippet
-
-            rag_snippets = [
-                RAGSnippet(
-                    source=s.get("source", ""),
-                    machine=s.get("machine", ""),
-                    title=s.get("title", ""),
-                    url=s.get("url", ""),
-                    content=s.get("content", ""),
-                    score=0.0,
-                )
-                for s in self._gibson_snippets
-            ]
-            response = await self.engine.synthesize_search_results(query, rag_snippets)
-            self._update_llm_cache_metrics(response.backend_meta)
-            summary = f"# GIBSON SUMMARY\n\n{response.answer.strip()}"
-            dashboard.show_gibson_summary(summary)
+        await self._search_manager.gibson_search_body(query)
 
     @work(exclusive=True, thread=False, group="llm")
     async def _run_gibson_synthesize_worker(self) -> None:
         """LLM-synthesize all current Gibson snippets into a master cheat sheet."""
-        dashboard = self._dashboard()
-        worker_name = self.__class__.__name__ + "." + sys._getframe().f_code.co_name.replace("_run_", "", 1)
-        self._register_worker(worker_name, asyncio.current_task())
-        self._analysis_busy(True)
-        dashboard.set_active_tool("Synthesize")
-        dashboard.set_gibson_loading(True)
-        try:
-            await self._with_worker_cancellation(self._gibson_synthesize_body())
-        except Exception as exc:
-            try:
-                dashboard.query_one("#gibson_viewer", Markdown).update(f"_Synthesis error: {exc}_")
-            except Exception:
-                pass
-        finally:
-            dashboard.set_active_tool("Idle")
-            self._analysis_busy(False)
-            dashboard.set_gibson_loading(False)
-            self._unregister_worker(worker_name)
+        await self._search_manager.run_gibson_synthesize_worker()
 
     async def _gibson_synthesize_body(self) -> None:
         """Synthesize current Gibson snippets into a master cheat sheet."""
-        from mentor.kb.query import RAGSnippet
-
-        dashboard = self._dashboard()
-        query = dashboard.query_one("#gibson_search_input", Input).value or "summarize"
-        snippets = [
-            RAGSnippet(
-                source=s.get("source", ""),
-                machine=s.get("machine", ""),
-                title=s.get("title", ""),
-                url=s.get("url", ""),
-                content=s.get("content", ""),
-                score=0.0,
-            )
-            for s in self._gibson_snippets
-        ]
-        response = await self.engine.synthesize_search_results(query, snippets)
-        self._update_llm_cache_metrics(response.backend_meta)
-        cheat_sheet = f"# MASTER CHEAT SHEET\n\n{response.answer.strip()}"
-        dashboard.query_one("#gibson_viewer", Markdown).update(cheat_sheet)
+        await self._search_manager.gibson_synthesize_body()
 
     @work(exclusive=True, thread=False, group="media")
     async def _run_remote_visual_worker(self, url: str) -> None:
-        dashboard = self._dashboard()
-        worker_name = self.__class__.__name__ + "." + sys._getframe().f_code.co_name.replace("_run_", "", 1)
-        self._register_worker(worker_name, asyncio.current_task())
-        dashboard.set_active_tool("Media")
-        try:
-            await self._with_worker_cancellation(self._visual_body(url))
-        except Exception as exc:
-            dashboard.append_system(f"Remote image load failed: {exc}", style="red")
-        finally:
-            dashboard.set_active_tool("Idle")
-            self._unregister_worker(worker_name)
+        await self._vision_manager.run_remote_visual_worker(url)
 
     async def _visual_body(self, url: str) -> None:
-        """Fetch remote image and save to buffer."""
-        dashboard = self._dashboard()
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.get(url, follow_redirects=True)
-            response.raise_for_status()
-
-        try:
-            from PIL import Image
-        except Exception:
-            Image = None  # type: ignore[assignment]
-
-        if Image is None:
-            dashboard.append_system("Pillow is unavailable; cannot decode remote image.", style="red")
-            return
-
-        try:
-            image = Image.open(BytesIO(response.content)).convert("RGB")
-        except Exception as exc:
-            dashboard.append_system(f"Could not decode remote image: {exc}", style="red")
-            return
-
-        remote_target = Path("data/temp/remote_visual_buffer.png")
-        remote_target.parent.mkdir(parents=True, exist_ok=True)
-        image.save(remote_target, format="PNG")
-        image.close()
-
-        self._uploaded_image_path = remote_target.resolve()
-        dashboard.set_visual_buffer_image(remote_target, source="Remote")
-        dashboard.append_system("Remote diagram loaded into Media Drawer.", style="bold cyan")
-        self.notify("Remote image loaded", title="Visual Buffer", severity="information")
+        await self._vision_manager.visual_body(url)
 
     def _try_dashboard(self) -> MainDashboard | None:
         """Return MainDashboard from active screen or stack, if present."""
-        active = self.screen
-        if isinstance(active, MainDashboard):
-            return active
-        for screen in reversed(getattr(self, "screen_stack", [])):
-            if isinstance(screen, MainDashboard):
-                return screen
-        return None
+        return resolve_dashboard(self)
 
     def _update_llm_cache_metrics(self, backend_meta: dict[str, object] | None) -> None:
-        dashboard = self._try_dashboard()
-        if dashboard is None or not backend_meta:
-            return
-
-        latency_obj = backend_meta.get("latency_ms")
-        cached_obj = backend_meta.get("tokens_cached")
-        latency_ms = latency_obj if isinstance(latency_obj, int) else None
-        tokens_cached = cached_obj if isinstance(cached_obj, int) else None
-        dashboard.set_llm_cache_metrics(latency_ms, tokens_cached)
+        self._chat_manager.update_llm_cache_metrics(backend_meta)
 
     async def _consume_llm_response(self, answer: str, thought: str) -> None:
         # Persist assistant text first so we don't lose it if UI updates fail.
@@ -834,15 +428,11 @@ class CerealKillerApp(App[None]):
                 self.notify(f"Response ready (UI error: {exc})", title="Zero Cool", severity="warning")
 
     def _analysis_busy(self, active: bool) -> None:
-        if active:
-            self._analysis_jobs += 1
-        else:
-            self._analysis_jobs = max(0, self._analysis_jobs - 1)
-        self._dashboard().set_loading(self._analysis_jobs > 0)
+        self._lifecycle_manager.analysis_busy(active)
 
     async def _run_boot_sequence(self) -> None:
-        dashboard = self._dashboard()
-        if not hasattr(self.engine, "settings"):
+        dashboard = self._try_dashboard()
+        if dashboard is None or not hasattr(self.engine, "settings"):
             return
         lines: list[str] = []
         async for result in run_boot_sequence(self.engine.settings):
@@ -859,239 +449,62 @@ class CerealKillerApp(App[None]):
         return re.sub(r"\[/?[^\]]+\]", "", text or "")
 
     async def _observe(self) -> None:
-        cwd = str(Path.cwd())
-        dashboard = self._dashboard()
-        last_auto_coach_time: float = 0.0
-        terminal_link_online = False
-
-        try:
-            async for event in observe_history_events(cwd):
-                # Set terminal link ONLINE on first successful event
-                if not terminal_link_online:
-                    dashboard.set_terminal_link_online(True)
-                    terminal_link_online = True
-                
-                if event.json_hint:
-                    self._append_chat("assistant", event.json_hint)
-                    dashboard.append_assistant(event.json_hint)
-                    continue
-
-                if not event.command:
-                    continue
-
-                # Pulse terminal link to show data is flowing
-                await dashboard.pulse_terminal_link()
-
-                self._run_cve_jit_worker(event.command)
-                if event.feedback_line:
-                    self._run_cve_jit_worker(event.feedback_line)
-
-                self.history_context = event.context_commands
-                self._update_context_token_counter()
-                phase = detect_phase(self.history_context)
-                dashboard.set_phase(phase)
-                self.engine.record_phase_change(phase)
-                self.engine.record_command_progress()
-
-                audit_warning = audit_methodology(event.command, self.history_context)
-                if audit_warning:
-                    dashboard.append_system(audit_warning, style="bold red")
-                    self._append_chat("assistant", audit_warning)
-
-                inferred_target = event.cd_target or event.host_target
-                if inferred_target and inferred_target != self.current_target:
-                    auto_cmd = f"/box {inferred_target}"
-                    cmd_result = await dispatch_command(auto_cmd, self.engine, self.kb.settings)
-                    if cmd_result is not None:
-                        await self._apply_command_result(cmd_result)
-
-                if not event.trigger_brain:
-                    continue
-
-                now = _time.monotonic()
-                if now - last_auto_coach_time < _AUTO_COACH_COOLDOWN_SECS:
-                    continue
-                last_auto_coach_time = now
-                self._run_autocoach_worker(event.command)
-        except RuntimeError as e:
-            # Permission error or other startup issue
-            dashboard.set_terminal_link_online(False)
-            error_msg = f"[red]Terminal Link Failed:[/red] {str(e)}"
-            self._append_chat("system", error_msg)
-            dashboard.append_system(error_msg, style="bold red")
-            raise
+        await self._observer.observe()
 
     async def _watch_clipboard(self) -> None:
-        async for detected in self.clipboard_watcher.watch():
-            self.post_message(detected)
+        await self._observer.watch_clipboard()
 
     def on_clipboard_image_detected(self, message: ClipboardImageDetected) -> None:
-        snapshot = message.snapshot
-        self._dashboard().set_visual_buffer_image(snapshot.image_path, source="Clipboard", preview=snapshot.preview)
-        self._uploaded_image_path = snapshot.image_path
-        self.notify(
-            f"Clipboard image buffered as {snapshot.image_path.name}",
-            title="Visual Buffer",
-            severity="information",
-        )
+        self._observer.on_clipboard_detected(message)
 
     @on(Button.Pressed, "#clear_visual_buffer")
     def clear_visual_buffer(self) -> None:
-        ok = clear_clipboard_buffer(VISION_BUFFER_PATH)
-        self._dashboard().clear_visual_buffer()
-        self._uploaded_image_path = None
-        if ok:
-            self.notify("Visual buffer cleared", title="Visual Buffer", severity="information")
-        else:
-            self.notify("Could not clear visual buffer", title="Visual Buffer", severity="warning")
+        self._observer.clear_visual_buffer()
 
     def _prime_uploaded_image(self, path: Path, source: str) -> None:
-        resolved = path.expanduser().resolve()
-        self._uploaded_image_path = resolved
+        self._vision_manager.prime_uploaded_image(path, source)
 
-        VISION_BUFFER_PATH.parent.mkdir(parents=True, exist_ok=True)
-        if resolved != VISION_BUFFER_PATH:
-            try:
-                shutil.copyfile(resolved, VISION_BUFFER_PATH)
-            except Exception:
-                pass
+    def _is_image_file(self, path: Path) -> bool:
+        return self._vision_manager.is_image_file(path)
 
-        preview = ascii_preview_for_image(resolved)
-        self._dashboard().set_visual_buffer_image(resolved, source=source, preview=preview)
-        self._dashboard().append_system(f"Image Uploaded: {resolved.name}", style="bold cyan")
+    def _looks_like_image_url(self, url: str) -> bool:
+        return self._vision_manager.looks_like_image_url(url)
 
-    @staticmethod
-    def _is_image_file(path: Path) -> bool:
-        return path.is_file() and path.suffix.lower() in _IMAGE_SUFFIXES
-
-    @staticmethod
-    def _looks_like_image_url(url: str) -> bool:
-        try:
-            parsed = urlparse(url)
-        except Exception:
-            return False
-        if parsed.scheme not in {"http", "https"}:
-            return False
-        lowered_path = (parsed.path or "").lower()
-        return any(lowered_path.endswith(suffix) for suffix in _IMAGE_SUFFIXES)
-
-    @classmethod
-    def _extract_visual_candidate_url(cls, snippets: list[dict]) -> str | None:
-        for snippet in snippets:
-            url = str(snippet.get("url", "")).strip()
-            if url and cls._looks_like_image_url(url):
-                return url
-
-            content = str(snippet.get("content", ""))
-            match = IMAGE_URL_RE.search(content)
-            if match:
-                return match.group(0)
-        return None
+    def _extract_visual_candidate_url(self, snippets: list[dict]) -> str | None:
+        return self._vision_manager.extract_visual_candidate_url(snippets)
 
     def _open_ingest_modal(self, ingest_type: str) -> None:
-        if ingest_type == "image" and Path("/screenshots").exists():
-            root = Path("/screenshots")
-        else:
-            root = Path.cwd()
-        self.push_screen(IngestModal(ingest_type=ingest_type, root_path=root), self._on_ingest_selection)
+        self._ingest_manager.open_ingest_modal(ingest_type)
 
     def _on_ingest_selection(self, selection: IngestSelection | None) -> None:
-        if selection is None:
-            return
-
-        chosen = selection.path.expanduser().resolve()
-        dashboard = self._dashboard()
-        dashboard.set_upload_progress(10, "UPLOAD")
-
-        if selection.ingest_type == "image":
-            if not is_image_path(chosen):
-                self.notify("Choose a .png/.jpg/.jpeg file", title="Ingest", severity="warning")
-                dashboard.set_upload_progress(0, "UPLOAD")
-                return
-            self._prime_uploaded_image(chosen, source="Modal")
-            self._run_vision_worker(str(chosen), source_label="Modal", mark_context=True)
-            return
-
-        if not is_document_path(chosen):
-            self.notify("Choose a .log/.txt/.json file", title="Ingest", severity="warning")
-            dashboard.set_upload_progress(0, "UPLOAD")
-            return
-        self._run_document_ingest_worker(str(chosen))
+        self._ingest_manager.on_ingest_selection(selection)
 
     def _on_web_search_state(self, active: bool) -> None:
-        dashboard = self._dashboard()
-        dashboard.set_active_tool("Web Search" if active else "Idle")
+        self._observer.set_web_search_state(active)
 
     def _refresh_knowledge_sync_status(self) -> None:
-        try:
-            statuses = fetch_sync_status(self.kb.settings, ["ippsec", "gtfobins", "lolbas", "hacktricks", "payloads"])
-            self._dashboard().set_knowledge_sync_status(statuses)
-        except Exception:
-            return
+        self._observer.update_knowledge_sync_status()
 
     def _refresh_github_api_status(self) -> None:
-        # Timer callbacks can fire while a modal screen is active.
-        # In that state MainDashboard is not the current screen, so skip safely.
-        try:
-            dashboard = self._dashboard()
-        except RuntimeError:
-            return
-
-        snapshot = get_rate_snapshot()
-        if snapshot is None:
-            dashboard.set_github_api_status("unknown")
-            return
-        reset_in = max(0, int((snapshot.reset_epoch - int(_time.time())) / 60))
-        dashboard.set_github_api_status(f"{snapshot.remaining}/{snapshot.limit} (Resets in {reset_in}m)")
+        self._observer.update_github_api_status()
 
     async def _run_system_readiness_check(self) -> None:
-        dashboard = self._try_dashboard()
-        if dashboard is None:
-            return
-
-        result = await check_system_readiness(self.kb.settings.llm_base_url)
-        if result.ok:
-            dashboard.set_system_readiness(True)
-            return
-
-        dashboard.set_system_readiness(False, result.details)
+        await self._observer.run_system_readiness_check()
 
     @work(exclusive=False, thread=False, group="cve-jit")
     async def _run_cve_jit_worker(self, text: str) -> None:
-        cve_ids = extract_cve_ids(text)
-        if not cve_ids:
-            return
-
-        dashboard = self._dashboard()
-        try:
-            await self._with_worker_cancellation(self._cve_jit_body(text, dashboard))
-        except Exception:
-            pass
+        await self._cve_jit.run_cve_jit_worker(text)
 
     async def _cve_jit_body(self, text: str, dashboard) -> None:
-        """Extract CVE IDs and fetch details for each."""
-        cve_ids = extract_cve_ids(text)
-        if not cve_ids:
-            return
-
-        def _warn(message: str) -> None:
-            dashboard.append_system(message, style="bold red")
-
-        for cve_id in cve_ids:
-            try:
-                await fetch_cve(self.kb.settings, cve_id, warn=_warn)
-            except Exception:
-                continue
-
-        self._refresh_github_api_status()
+        await self._cve_jit.cve_jit_body(text, dashboard)
 
     @on(Button.Pressed, "#easy_button")
-    def show_walkthrough(self) -> None:
+    async def show_walkthrough(self) -> None:
         self._record_easy_usage()
         machine_name = Path.cwd().name
-        solution_markdown = retrieve_solution_for_machine(self.kb.settings, machine_name)
+        solution_markdown = await retrieve_solution_for_machine(self.kb.settings, machine_name)
         self.push_screen(SolutionModal(solution_markdown))
-        
+
         # Attempt to open IppSec YouTube link if available
         self._open_ippsec_link(machine_name)
 
@@ -1116,208 +529,102 @@ class CerealKillerApp(App[None]):
 
     def _register_worker(self, name: str, task: asyncio.Task[None]) -> None:
         """Register a worker task for tracking/cancellation."""
-        self._active_workers[name] = task
+        self._lifecycle_manager.register_worker(name, task)
 
     def _cancel_worker(self, name: str) -> None:
         """Cancel a specific worker by name."""
-        if name in self._active_workers:
-            task = self._active_workers[name]
-            if not task.done():
-                task.cancel()
-            self._active_workers.pop(name, None)
+        self._lifecycle_manager.cancel_worker(name)
 
     def cancel_all_workers(self) -> None:
         """Cancel all pending workers to prevent race conditions."""
-        for name, task in list(self._active_workers.items()):
-            if not task.done():
-                task.cancel()
-        self._active_workers.clear()
+        self._lifecycle_manager.cancel_all_workers()
 
     def _unregister_worker(self, name: str) -> None:
         """Unregister a completed worker."""
-        self._active_workers.pop(name, None)
+        self._lifecycle_manager.unregister_worker(name)
 
     async def _with_worker_cancellation(self, coro: Any) -> Any:
         """Cancel all existing workers before running the given coroutine.
 
         Prevents race conditions when multiple @work workers share
-        chat_transcript / history_context.
+        the active per-box context.
         """
-        for name, task in list(self._active_workers.items()):
-            if not task.done():
-                task.cancel()
-        try:
-            return await coro
-        except asyncio.CancelledError:
-            raise
+        return await self._lifecycle_manager.with_worker_cancellation(coro)
 
     async def _apply_command_result(self, result: CommandResult) -> None:
-        dashboard = self._dashboard()
-        cleaned_message = self._strip_rich_tags(result.message)
-        dashboard.append_system(cleaned_message, style="cyan")
-        self._append_chat("assistant", cleaned_message)
-        self._run_cve_jit_worker(cleaned_message)
-
-        if result.system_prompt_addendum is not None:
-            self.engine.set_system_prompt_addendum(result.system_prompt_addendum)
-
-        if result.new_target:
-            self.current_target = result.new_target
-            self._update_header_target(result.new_target)
-            dashboard.set_upload_root(Path.cwd())
-            self.notify(
-                f"Context switched -> {result.new_target.upper()}",
-                title="Target Loaded",
-                severity="information",
-            )
-            self.engine.record_phase_change("[IDLE]")
-
-        if result.reset_phase:
-            dashboard.set_phase("[IDLE]")
+        self._command_handler.apply_command_result(result)
 
     def _schedule_persist_mental_state(self) -> None:
-        if hasattr(self.engine, "persist_mental_state"):
-            asyncio.create_task(self.engine.persist_mental_state(self.history_context))
+        self._session_manager.schedule_persist()
 
     def _schedule_context_prune(self) -> None:
-        if not self._pruning_in_flight:
-            asyncio.create_task(self._maybe_prune_transcript())
+        self._context_manager_instance.schedule_prune()
 
     async def _maybe_prune_transcript(self) -> None:
-        if self._pruning_in_flight:
-            return
-
-        total_chars = sum(len(e.get("text", "")) for e in self.chat_transcript)
-        threshold = self.engine.prune_threshold()
-        needs_budget_prune = total_chars > threshold
-        needs_turn_condense = self._context_manager.should_condense(self.chat_transcript)
-
-        if not needs_budget_prune and not needs_turn_condense:
-            return
-
-        self._pruning_in_flight = True
-        try:
-            if needs_turn_condense:
-                entries_to_summarize, remaining = self._context_manager.select_entries_for_condense(self.chat_transcript)
-                if entries_to_summarize:
-                    summary_blob = self._context_manager.build_summary_blob(entries_to_summarize)
-                    summary = await self.engine.summarize_session(summary_blob)
-                    self.chat_transcript = [self._context_manager.make_summary_entry(summary), *remaining]
-                    self._update_context_token_counter()
-                    return
-
-            target = self.engine.prune_target()
-            chars_to_drop = total_chars - target
-            entries_to_summarize: list[dict[str, str]] = []
-            dropped = 0
-            for entry in self.chat_transcript:
-                if dropped >= chars_to_drop:
-                    break
-                entries_to_summarize.append(entry)
-                dropped += len(entry.get("text", ""))
-            if not entries_to_summarize:
-                return
-            blob = "\n".join(
-                f"{e.get('role', 'unknown')}: {e.get('text', '')}" for e in entries_to_summarize
-            )
-            summary = await self.engine.summarize_session(blob)
-            summary_entry = {
-                "role": "summary",
-                "text": summary,
-                "timestamp": datetime.now(UTC).isoformat(),
-            }
-            remaining = self.chat_transcript[len(entries_to_summarize):]
-            self.chat_transcript = [summary_entry, *remaining]
-            self._update_context_token_counter()
-        finally:
-            self._pruning_in_flight = False
+        await self._context_manager_instance.maybe_prune_transcript()
 
     def _append_chat(self, role: str, text: str) -> None:
-        self.chat_transcript.append(
-            {
-                "role": role,
-                "text": text,
-                "timestamp": datetime.now(UTC).isoformat(),
-            }
-        )
-        self._update_context_token_counter()
-        self._schedule_context_prune()
+        self._context_manager_instance.append_chat(role, text)
 
     def _update_context_token_counter(self) -> None:
+        self._context_manager_instance.update_token_counter()
+
+    def _warn_if_repetitive_response(self, new_response: str) -> None:
+        self._context_manager_instance.warn_repetitive(new_response)
+
+    async def _safe_stream_thought(self, thought: str, *, dashboard: MainDashboard | None = None) -> None:
+        task = self._chat_manager.safe_stream_thought(thought, dashboard=dashboard)
+        if task is not None:
+            await task
+
+    def _track_code_block(self, response_text: str) -> None:
+        self._context_manager_instance.track_code_block(response_text)
+
+    def _adjust_pathetic_meter(self) -> None:
+        self._session_manager.adjust_pathetic_meter()
+
+    def _record_easy_usage(self, weight: int = 1) -> None:
+        self._session_manager.record_easy_usage(weight)
+
+    def _open_ippsec_link(self, machine_name: str) -> None:
+        self._misc_manager.open_ippsec_link(machine_name)
+
+    def _spawn_background_task(self, coro: Any) -> asyncio.Task[Any]:
+        """Spawn and track best-effort background tasks for clean shutdown."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    def set_active_machine(self, machine: str) -> None:
+        """Switch active machine across app, context store, and engine."""
+        normalized = (machine or "").strip()
+        if not normalized:
+            return
+        self.current_target = normalized
+        self._update_header_target(normalized)
+        self.engine.set_active_machine(normalized)
+        self._context_per_box.set_active_machine(normalized)
+
+    def set_active_history(self, commands: list[str]) -> None:
+        """Set history for the current active machine."""
+        self._context_per_box.set_active_history(commands)
+
+    def set_active_transcript(self, entries: list[dict[str, str]]) -> None:
+        """Set transcript for the current active machine."""
+        self._context_per_box.set_active_transcript(entries)
+
+    def toggle_thought_stream(self) -> None:
+        """Toggle visibility of the thought stream panel."""
         dashboard = self._try_dashboard()
         if dashboard is None:
             return
-        current_tokens = self._context_manager.estimate_active_context_tokens(
-            self.chat_transcript,
-            self.history_context,
-        )
-        max_tokens = int(getattr(self.engine.settings, "max_model_len", 0) or 0)
-        dashboard.set_context_token_counter(current_tokens, max_tokens)
-
-    def _warn_if_repetitive_response(self, new_response: str) -> None:
-        last_assistant = ""
-        for entry in reversed(self.chat_transcript):
-            if entry.get("role") == "assistant":
-                last_assistant = str(entry.get("text", ""))
-                break
-        if not last_assistant or not new_response:
-            return
-        ratio = difflib.SequenceMatcher(None, last_assistant, new_response).ratio()
-        if ratio >= 0.90:
-            self.notify(
-                "[System] Zero Cool is repeating himself. Try providing more specific tool output.",
-                title="Repetition Warning",
-                severity="warning",
-            )
-
-    async def _safe_stream_thought(self, thought: str, *, dashboard: MainDashboard | None = None) -> None:
-        """Best-effort thought streaming with backward-compatible fallbacks."""
-        active_dashboard = dashboard or self._try_dashboard()
-        if active_dashboard is None:
-            return
-        stream_method = getattr(active_dashboard, "stream_thought", None)
-        if callable(stream_method):
-            await stream_method(thought)
-            return
-        thought_box_method = getattr(active_dashboard, "thought_box", None)
-        if callable(thought_box_method):
-            thought_box = thought_box_method()
-            if thought_box is not None and hasattr(thought_box, "stream_thought"):
-                await thought_box.stream_thought(thought)
-
-    def _track_code_block(self, response_text: str) -> None:
-        matches = CODE_BLOCK_PATTERN.findall(response_text)
-        if matches:
-            self.last_code_block = matches[-1].strip()
-
-    def _adjust_pathetic_meter(self) -> None:
-        total = self.easy_usage_count + self.successful_command_count
-        if total <= 0:
-            self.pathetic_meter = 0
-        else:
-            ratio = self.easy_usage_count / total
-            self.pathetic_meter = max(0, min(10, round(ratio * 10)))
-        self._dashboard().set_pathetic_meter(self.pathetic_meter)
-
-    def _record_easy_usage(self, weight: int = 1) -> None:
-        self.easy_usage_count += max(1, weight)
-        self._adjust_pathetic_meter()
-
-    def _open_ippsec_link(self, machine_name: str) -> None:
-        """Open IppSec YouTube video link in default browser."""
+        # Toggle thought panel visibility if it exists
         try:
-            # Try to find IppSec video metadata from knowledge base
-            # Construct ippsec.rocks link: https://ippsec.rocks/?n=MachineName
-            machine_safe = machine_name.replace("_", "-").replace(" ", "-").lower()
-            url = f"https://ippsec.rocks/?n={machine_safe}"
-            
-            # Open in default browser using xdg-open (Linux) or open (Mac)
-            opener = "xdg-open" if shutil.which("xdg-open") else ("open" if shutil.which("open") else None)
-            if opener:
-                subprocess.Popen([opener, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                self._dashboard().append_system(f"📺 Opened IppSec video: {url}", style="dim cyan")
+            panel = dashboard.query_one("#thought_panel", None)
+            if panel is not None:
+                panel.styles.display = "none" if panel.styles.display != "none" else "block"
         except Exception:
-            # Silently fail if browser can't be opened
             pass
 
     def _update_header_target(self, target: str | None = None) -> None:
@@ -1326,18 +633,4 @@ class CerealKillerApp(App[None]):
         self.sub_title = f"TARGET: {active_target}"
 
     def _save_session_snapshot(self, reason: str) -> None:
-        session_dir = Path("data/sessions")
-        session_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-        payload = {
-            "reason": reason,
-            "timestamp": datetime.now(UTC).isoformat(),
-            "cwd": str(Path.cwd()),
-            "phase": detect_phase(self.history_context),
-            "pathetic_meter": self.pathetic_meter,
-            "history_context": self.history_context,
-            "last_code_block": self.last_code_block,
-            "chat": self.chat_transcript,
-        }
-        target = session_dir / f"zero-cool-session-{timestamp}.json"
-        target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self._session_manager.save_session_snapshot(reason)

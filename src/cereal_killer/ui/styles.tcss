@@ -618,3 +618,43 @@ Footer .footer--description {
 .hidden {
     display: none;
 }
+
+/* ── Streaming styles ─────────────────────────────────────────────────── */
+
+#streaming_indicator {
+    height: auto;
+    padding: 1;
+    display: none;
+    background: #050a12;
+    border: none;
+    align: center middle;
+}
+
+#streaming_indicator.streaming {
+    display: block;
+    color: #00ffd5;
+}
+
+#streaming_indicator LoadingIndicator {
+    width: 3;
+    height: auto;
+}
+
+.streaming-active #chat_log {
+    border: solid #00ffd5;
+}
+
+.streaming-indicator {
+    background: #0a1724;
+    color: #00ffd5;
+}
+
+/* ── Streaming-only elements (hidden by default) ──────────────────────── */
+
+.streaming-only {
+    display: none;
+}
+
+.streaming-active .streaming-only {
+    display: block;
+}
