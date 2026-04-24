@@ -91,6 +91,85 @@ class Settings:
     # RAG search timeout in seconds. If the tiered search takes longer than this,
     # partial results are returned to avoid blocking the UI.
     rag_timeout: float = float(os.getenv("RAG_TIMEOUT", "10"))
+    embedding_model: str = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    session_cache_ttl: int = int(os.getenv("SESSION_CACHE_TTL", "300"))
+    # LLM response cache configuration
+    enable_llm_cache: bool = os.getenv("LLM_CACHE_ENABLED", "1").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    llm_cache_maxsize: int = int(os.getenv("LLM_CACHE_MAXSIZE", "100"))
+    llm_cache_ttl: int = int(os.getenv("LLM_CACHE_TTL", "300"))
+    enable_streaming: bool = os.getenv("STREAMING_ENABLED", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    # Whether to use LiteLLM as the LLM provider instead of the OpenAI client.
+    use_litellm: bool = os.getenv("USE_LITELLM", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    # Redis connection pool configuration
+    redis_pool_max_connections: int = int(os.getenv("REDIS_POOL_MAX_CONNECTIONS", "10"))
+    redis_pool_socket_timeout: float = float(os.getenv("REDIS_POOL_SOCKET_TIMEOUT", "5.0"))
+    # RAG batch embedding: number of queries to batch together before encoding.
+    # Set to 1 to disable batching (use individual embed() calls).
+    rag_batch_size: int = int(os.getenv("RAG_BATCH_SIZE", "4"))
+
+    # Tuple of security tool names available in the environment.
+    tech_tools: tuple[str, ...] = (
+        "nmap",
+        "gobuster",
+        "feroxbuster",
+        "ffuf",
+        "nikto",
+        "sqlmap",
+        "dirsearch",
+        "wfuzz",
+        "smbclient",
+        "smbmap",
+        "enum4linux",
+        "msfconsole",
+        "netexec",
+        "crackmapexec",
+        "hydra",
+        "john",
+        "hashcat",
+        "tcpdump",
+        "wireshark",
+        "nuclei",
+    )
+
+    # Subset of tech_tools that use a prefix-based naming convention
+    # (e.g. tool-name-something) rather than a full name match.
+    tech_tool_prefixes: tuple[str, ...] = ("nmap", "gobuster", "smb", "enum4linux")
+
+    # Number of seconds to wait before re-issuing feedback for the same issue.
+    feedback_cooldown_seconds: int = 30
+
+    # Maximum number of tool commands to retain in context for the agent.
+    command_context_limit: int = 20
+
+    # Number of consecutive turns without progress before the agent is considered stuck.
+    stuck_turn_limit: int = 5
+
+    # Maximum number of prompts that can be pinned simultaneously.
+    max_pinned_prompts: int = 50
+
+    # Internal application name aliases used for identification.
+    app_internal_names: tuple[str, ...] = ("cereal-killer", "cereal_killer", "gibson")
+
+    # Maximum number of embeddings to cache.
+    embed_cache_size: int = 1000
+
+    # TTL in seconds for entries in the embedding cache.
+    embed_cache_ttl_seconds: int = 3600
 
 
 HISTORY_CONTEXT_LIMIT = 50

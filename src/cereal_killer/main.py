@@ -8,6 +8,7 @@ from pathlib import Path
 from cereal_killer.config import get_settings
 from cereal_killer.engine import LLMEngine
 from cereal_killer.knowledge_base import KnowledgeBase
+from cereal_killer.logging_config import setup_logging, _is_debug_mode
 from cereal_killer.ui import CerealKillerApp
 
 
@@ -48,7 +49,13 @@ def _run_preflight() -> tuple[bool, str]:
 
 
 def main() -> None:
+    logger = setup_logging()
     settings = get_settings()
+    logger.info("cereal-killer starting (DEBUG=%s)", "on" if _is_debug_mode() else "off")
+    logger.info("Redis: %s", settings.redis_url)
+    logger.info("LLM: %s (model: %s)", settings.llm_base_url, settings.llm_model)
+    logger.info("Embedding: %s", settings.embedding_model)
+    logger.info("RAG timeout: %.1fs", settings.rag_timeout)
     hard_fail, reason = _run_preflight()
     app = CerealKillerApp(
         engine=LLMEngine(settings),

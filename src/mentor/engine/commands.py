@@ -92,7 +92,7 @@ async def _cmd_box(args: list[str], engine: object, settings: Settings) -> Comma
     machine = args[0].strip().lower()
     # Retrieve walkthrough material — best-effort; if Redis is down we still proceed.
     try:
-        solution_md = retrieve_solution_for_machine(settings, machine)
+        solution_md = await retrieve_solution_for_machine(settings, machine)
         has_material = "No Redis walkthrough" not in solution_md
     except Exception as exc:
         solution_md = f"[context unavailable: {exc}]"

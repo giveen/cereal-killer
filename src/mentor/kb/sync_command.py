@@ -10,6 +10,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from mentor.kb.redis_pool import get_sync_client
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,22 +50,21 @@ async def sync_all_command(
     try:
         from cereal_killer.knowledge_base import sync_ippsec_dataset
 
-        await asyncio.to_thread(sync_ippsec_dataset)
+        await sync_ippsec_dataset()
         summary["ippsec"] = {"ingested": 1, "failed": 0}
         try:
-            from redis import Redis
-
-            client = Redis.from_url(settings.redis_url, decode_responses=True)
-            client.hset(
-                "kb:sync:ippsec",
-                mapping={
-                    "last_sync": datetime.now(UTC).isoformat(),
-                    "source": "ippsec",
-                    "index": settings.redis_index,
-                    "count": "1",
-                    "failed": "0",
-                },
-            )
+            client = get_sync_client(settings.redis_url, decode_responses=True)
+            if client is not None:
+                client.hset(
+                    "kb:sync:ippsec",
+                    mapping={
+                        "last_sync": datetime.now(UTC).isoformat(),
+                        "source": "ippsec",
+                        "index": settings.redis_index,
+                        "count": "1",
+                        "failed": "0",
+                    },
+                )
         except Exception:
             pass
     except Exception:
@@ -118,6 +119,7 @@ async def sync_hacktricks_command(
                 ],
                 check=True,
                 capture_output=True,
+                timeout=300,  # 5 minute timeout for git clone
             )
             print("    ✓ Clone complete")
         except subprocess.CalledProcessError as e:
@@ -130,6 +132,7 @@ async def sync_hacktricks_command(
                 ["git", "-C", str(hacktricks_dir), "pull"],
                 check=True,
                 capture_output=True,
+                timeout=300,  # 5 minute timeout for git pull
             )
             print("    ✓ Update complete")
         except subprocess.CalledProcessError:
@@ -167,9 +170,10 @@ async def sync_hacktricks_command(
     print(f"    Using Redis: {settings.redis_url}")
 
     try:
-        from redis import Redis
-
-        redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
+        redis_client = get_sync_client(settings.redis_url, decode_responses=True)
+        if redis_client is None:
+            print("    ✗ Redis connection failed: redis package unavailable")
+            sys.exit(1)
         redis_client.ping()
     except Exception as e:
         print(f"    ✗ Redis connection failed: {e}")

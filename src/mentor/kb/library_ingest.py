@@ -33,6 +33,7 @@ try:
 except ImportError:  # pragma: no cover
     IndexSchema = None  # type: ignore[assignment]
 
+from mentor.kb.redis_pool import get_sync_client
 from mentor.kb.query import EMBEDDING_DIMS, embed
 
 
@@ -145,6 +146,7 @@ def clone_or_pull(source: SourceConfig) -> None:
             check=True,
             capture_output=True,
             text=True,
+            timeout=300,  # 5 minute timeout for git clone
         )
         return
     subprocess.run(
@@ -152,6 +154,7 @@ def clone_or_pull(source: SourceConfig) -> None:
         check=True,
         capture_output=True,
         text=True,
+        timeout=300,  # 5 minute timeout for git pull
     )
 
 
@@ -371,10 +374,10 @@ async def ingest_chunks_for_source(
     *,
     batch_size: int = 50,
 ) -> dict[str, int]:
-    if Redis is None:
-        raise RuntimeError("redis package is required for ingestion.")
     _ensure_index(settings, source.index)
-    client = Redis.from_url(settings.redis_url, decode_responses=True)
+    client = get_sync_client(settings.redis_url, decode_responses=True)
+    if client is None:
+        raise RuntimeError("redis package is required for ingestion.")
     now_iso = datetime.now(UTC).isoformat()
 
     # Rebuild this source from a clean slate so stale/invalid hashes from prior
@@ -422,10 +425,10 @@ async def ingest_chunks_for_source(
 
 def fetch_sync_status(settings: Settings, source_names: list[str]) -> dict[str, str]:
     statuses = {name: "never" for name in source_names}
-    if Redis is None:
-        return statuses
     try:
-        client = Redis.from_url(settings.redis_url, decode_responses=True)
+        client = get_sync_client(settings.redis_url, decode_responses=True)
+        if client is None:
+            return statuses
     except Exception:
         return statuses
 
@@ -512,10 +515,10 @@ def purge_source_by_url(
 
     Returns the number of keys deleted.
     """
-    if Redis is None:
-        return 0
     try:
-        client = Redis.from_url(settings.redis_url, decode_responses=True)
+        client = get_sync_client(settings.redis_url, decode_responses=True)
+        if client is None:
+            return 0
     except Exception:
         return 0
 

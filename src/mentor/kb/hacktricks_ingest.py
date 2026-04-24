@@ -334,7 +334,7 @@ def build_hacktricks_schema() -> dict[str, Any]:
                 "type": "vector",
                 "attrs": {
                     "algorithm": "flat",
-                    "dims": 1536,  # OpenAI embedding dimension (or adjust for your model)
+                    "dims": 768,  # nomic-embed-text / sentence-transformers dimension
                     "distance_metric": "cosine",
                     "datatype": "float32",
                 },

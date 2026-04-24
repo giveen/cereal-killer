@@ -5,11 +5,13 @@ import hashlib
 import os
 import platform
 import re
+import logging
 import shlex
 import time as _time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 try:
     import pwd
@@ -28,22 +30,57 @@ from cereal_killer.config import HISTORY_CONTEXT_LIMIT
 TECHNICAL_TOOLS = {
     "nmap",
     "gobuster",
+    "feroxbuster",
+    "ffuf",
+    "nikto",
+    "sqlmap",
+    "dirsearch",
+    "wfuzz",
     "smbclient",
     "smbmap",
     "enum4linux",
-    "ffuf",
-    "nikto",
-    "wfuzz",
-    "dirsearch",
-    "sqlmap",
-    "hydra",
+    "msfconsole",
     "netexec",
     "crackmapexec",
-    "msfconsole",
-    "tcpdump",
+    "hydra",
     "john",
     "hashcat",
+    "tcpdump",
+    "wireshark",
+    "nuclei",
 }
+
+def _is_similar_command(command1: str, command2: str) -> bool:
+    """Check if two commands are semantically similar.
+
+    Returns True if the commands are the same or differ only by arguments
+    (e.g., different IPs, ports, file paths).
+    """
+    # Normalize commands
+    cmd1 = " ".join(command1.strip().split()).lower()
+    cmd2 = " ".join(command2.strip().split()).lower()
+
+    # Exact match
+    if cmd1 == cmd2:
+        return True
+
+    # Similar if they differ only by arguments
+    cmd1_parts = cmd1.split()
+    cmd2_parts = cmd2.split()
+
+    if len(cmd1_parts) != len(cmd2_parts):
+        return False
+
+    # Check if same command with different arguments
+    for part1, part2 in zip(cmd1_parts, cmd2_parts):
+        # Skip if parts differ only by numbers or paths
+        if part1 != part2:
+            # Extract numbers and paths
+            part1_no_num = re.sub(r'\d+', 'NUM', part1)
+            part2_no_num = re.sub(r'\d+', 'NUM', part2)
+            if part1_no_num != part2_no_num:
+                return False
+    return True
 
 
 @dataclass(slots=True)
@@ -182,7 +219,11 @@ def _is_python_code_line(command: str) -> bool:
     return False
 
 
-def is_technical_command(command: str) -> bool:
+def is_technical_command(
+    command: str,
+    tech_tools: frozenset[str] | None = None,
+    prefixes: tuple[str, ...] | None = None,
+) -> bool:
     # Never treat Python source code lines as technical commands
     if _is_python_code_line(command):
         return False
@@ -197,9 +238,13 @@ def is_technical_command(command: str) -> bool:
     if cmd in {"sudo", "doas"} and len(parts) > 1:
         cmd = parts[1].lower()
 
-    if cmd in TECHNICAL_TOOLS:
+    # Prefer provided tech_tools, fall back to hardcoded TECHNICAL_TOOLS
+    tools_set = tech_tools if tech_tools is not None else TECHNICAL_TOOLS
+    if cmd in tools_set:
         return True
-    return any(cmd.startswith(prefix) for prefix in ("nmap", "gobuster", "smb", "enum4linux"))
+    # Prefer provided prefixes, fall back to hardcoded defaults
+    prefix_list = prefixes if prefixes is not None else ("nmap", "gobuster", "smb", "enum4linux")
+    return any(cmd.startswith(prefix) for prefix in prefix_list)
 
 
 # Prose/markup patterns that indicate the line is AI-generated output, not raw
@@ -237,8 +282,11 @@ def detect_feedback_signal(text: str) -> str | None:
         "nt_status_logon_failure",
         "exploit completed, but no session was created",
         "no session was created",
-        # "failed" alone is intentionally omitted — it matches AI explanations.
-        # Use the specific compound forms above instead.
+        "error:",
+        "failed:",
+        "timeout",
+        "timed out",
+        "refused",
     )
     success_markers = (
         "root@",
@@ -247,12 +295,18 @@ def detect_feedback_signal(text: str) -> str | None:
         "pwned",
         "shell spawned",
         "whoami\nroot",
+        "access granted",
+        "connection established",
+        "session opened",
+        "successfully",
+        "complete",
+        "done",
     )
 
-    if any(marker in normalized for marker in success_markers):
-        return "success"
     if any(marker in normalized for marker in failure_markers):
         return "failure"
+    if any(marker in normalized for marker in success_markers):
+        return "success"
     return None
 
 
@@ -340,7 +394,10 @@ def filter_context_commands(commands: list[str], cwd: str, limit: int = HISTORY_
             else:
                 shell_dir = (shell_dir / target).resolve()
 
-        if shell_dir == cwd_path or cwd in stripped or (cwd_name and cwd_name in stripped):
+        # Enhanced filtering: check if command is relevant to current directory
+        # or any parent directory in the current path
+        cmd_path_match = any(target in stripped for target in shell_dir.parts)
+        if shell_dir == cwd_path or cwd in stripped or (cwd_name and cwd_name in stripped) or cmd_path_match:
             scoped.append(command)
 
     if not scoped:
@@ -351,6 +408,8 @@ def filter_context_commands(commands: list[str], cwd: str, limit: int = HISTORY_
 # Minimum seconds between two consecutive feedback-triggered brain calls.
 # Prevents a loop where the AI response (containing failure keywords) is
 # captured by a shell tee and fed back into the same feedback file.
+# When settings is available, the cooldown is resolved at call time
+# inside observe_history via the `settings` parameter.
 _FEEDBACK_COOLDOWN_SECS = 30
 
 
@@ -398,14 +457,28 @@ def _resolve_history_path() -> Path:
     return Path.home() / ".bash_history"
 
 
-async def observe_history(cwd: str) -> AsyncIterator[HistoryEvent]:
+async def observe_history(cwd: str, settings: Any = None) -> AsyncIterator[HistoryEvent]:
     if awatch is None or Change is None:
         raise RuntimeError("watchfiles is required for asynchronous history stalking.")
+
+    # Resolve settings-based values at call time.
+    # When settings is available, use its tech_tools and feedback cooldown.
+    # Otherwise fall back to the hardcoded defaults.
+    _tech_tools: frozenset[str] | None = None
+    _cooldown_secs: float = _FEEDBACK_COOLDOWN_SECS
+    if settings is not None:
+        _tech_tools = frozenset(getattr(settings, "tech_tools", []))
+        _cooldown_secs = getattr(settings, "feedback_cooldown_seconds", _FEEDBACK_COOLDOWN_SECS)
 
     history_path = _resolve_history_path()
     
     # Check if history path is readable and try one more fallback before erroring.
     is_readable, error_msg = _check_history_path_readable(history_path)
+    if not is_readable:
+        logging.getLogger(__name__).error(error_msg)
+        raise RuntimeError(error_msg)
+    
+    # Try one more fallback before erroring.
     if not is_readable:
         for candidate in candidate_history_files():
             if candidate == history_path:
@@ -421,6 +494,8 @@ async def observe_history(cwd: str) -> AsyncIterator[HistoryEvent]:
     
     target = history_path
     feedback_files = candidate_feedback_files()
+    if not feedback_files:
+        logging.getLogger(__name__).debug("No feedback files found")
     watch_targets = [target, *feedback_files]
     feedback_offsets: dict[Path, int] = {}
     for feedback_file in feedback_files:
@@ -462,8 +537,9 @@ async def observe_history(cwd: str) -> AsyncIterator[HistoryEvent]:
                     fh.seek(feedback_offsets.get(feedback_file, 0))
                     fresh_lines = fh.read().splitlines()
                     feedback_offsets[feedback_file] = fh.tell()
-            except OSError:
-                fresh_lines = []
+            except OSError as exc:
+                logging.getLogger(__name__).warning(f"Error reading feedback file {feedback_file}: {exc}")
+                continue
 
             for line in fresh_lines:
                 signal = detect_feedback_signal(line)
@@ -483,7 +559,7 @@ async def observe_history(cwd: str) -> AsyncIterator[HistoryEvent]:
                 # --- Loop-break guards ---
                 # 1. Cooldown: suppress if we fired too recently.
                 now = _time.monotonic()
-                if now - _last_feedback_trigger < _FEEDBACK_COOLDOWN_SECS:
+                if now - _last_feedback_trigger < _cooldown_secs:
                     continue
                 # 2. Deduplication: same exact line already fired once — skip.
                 line_hash = command_hash(line.strip())
@@ -508,7 +584,6 @@ async def observe_history(cwd: str) -> AsyncIterator[HistoryEvent]:
             continue
 
         try:
-            # Read file in binary mode and track size for delta-only reads
             current_size = target.stat().st_size
             if current_size < file_offset:
                 # File was truncated/rotated - read entire file
@@ -525,7 +600,8 @@ async def observe_history(cwd: str) -> AsyncIterator[HistoryEvent]:
                 continue
             
             file_offset = current_size
-        except OSError:
+        except OSError as exc:
+            logging.getLogger(__name__).warning(f"Error reading history file {target}: {exc}")
             continue
 
         parsed = parse_history_lines(text)
@@ -553,7 +629,7 @@ async def observe_history(cwd: str) -> AsyncIterator[HistoryEvent]:
             yield HistoryEvent(
                 command=command,
                 context_commands=context_commands,
-                trigger_brain=is_technical_command(command) or feedback_signal is not None,
+                trigger_brain=is_technical_command(command, tech_tools=_tech_tools) or feedback_signal is not None,
                 feedback_signal=feedback_signal,
                 feedback_line=command if feedback_signal else None,
                 cd_target=cd_target,

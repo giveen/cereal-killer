@@ -8,13 +8,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from mentor.kb.query import RAGSnippet
+from mentor.kb.query import RAGSnippet, embed
 
 
 def query_hacktricks_from_redis(
     redis_client: Any,
     query_text: str,
-    embed_fn: Any,
+    embed_fn: Any = None,
     limit: int = 3,
 ) -> list[RAGSnippet]:
     """Query HackTricks index directly from Redis by vector similarity.
@@ -28,6 +28,8 @@ def query_hacktricks_from_redis(
     Returns:
         List of RAGSnippet objects with HackTricks content
     """
+    # Use the default sentence-transformers embed function if none provided
+    embed_fn = embed_fn or embed
     try:
         # Embed the query
         query_vector = embed_fn(query_text)
