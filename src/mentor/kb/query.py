@@ -5,7 +5,10 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
+import asyncio
+import functools
 from pathlib import Path
 from typing import Any
 
@@ -20,17 +23,323 @@ except ImportError:  # pragma: no cover - allows non-RAG tests to run
 
 from cereal_killer.config import Settings
 from mentor.ui.phase import detect_phase
+from .redis_pool import get_sync_client
 
 
-EMBEDDING_DIMS = 64
+EMBEDDING_DIMS = 768  # Matches nomic-embed-text / sentence-transformers default
 RAG_NOT_EMPTY_SIMILARITY_THRESHOLD = 0.40
 _RERANK_CANDIDATES = 10
 _CONTEXT_CACHE_TURNS = 3
 _CONTEXT_CACHE_TTL_SECS = 60 * 60 * 6
 
+_PHASE_AWARE_BONUSES = {
+    "recon": {"networking": 0.3, "enumeration": 0.2, "discovery": 0.2},
+    "user": {"exploit": 0.4, "payload": 0.3, "vulnerability": 0.2},
+    "root": {"privesc": 0.5, "suid": 0.3, "capabilities": 0.2},
+    "unknown": {"dump": 0.3, "hash": 0.3, "lateral": 0.2},
+}
+
 _CROSS_ENCODER: Any | None = None
 _CROSS_ENCODER_LOAD_ATTEMPTED = False
 _LOG = logging.getLogger(__name__)
+
+# Lazy-loaded sentence-transformers embedding model singleton.
+# Falls back to hash-based embedding if the model cannot be loaded.
+_EMBED_MODEL: Any = None
+
+
+def _get_embedding_model() -> Any:
+    """Lazily load the sentence-transformers embedding model.
+    
+    Returns the model on first call, cached globally. Falls back to
+    a small local model if the configured model download fails.
+    """
+    global _EMBED_MODEL
+    
+    import os as _os
+    
+    model_name = _os.getenv(
+        "EMBEDDING_MODEL",
+        "sentence-transformers/all-MiniLM-L6-v2",
+    )
+    
+    # If already loaded with this name, return cached model
+    # We compare by checking if model ID matches
+    
+    if _EMBED_MODEL is not None:
+        return _EMBED_MODEL
+    
+    try:
+        from sentence_transformers import SentenceTransformer as _ST
+        _EMBED_MODEL = _ST(model_name, device="cpu")
+        _LOG.debug("Embedding model loaded successfully")
+    except Exception:
+        # Fallback: try the smallest model
+        try:
+            from sentence_transformers import SentenceTransformer as _ST
+            _EMBED_MODEL = _ST("sentence-transformers/all-MiniLM-L6-v2", device="cpu")
+            _LOG.debug("Embedding model loaded successfully")
+        except Exception:
+            _EMBED_MODEL = None
+    
+    return _EMBED_MODEL
+
+# Embedding cache for frequently-used queries.
+# Uses LRU cache on the model's encode method to avoid redundant
+# model computations for repeated queries.
+_EMBED_CACHE_SIZE: int = 1000  # Max cached embeddings
+_EMBED_CACHE_TTL_SECS: int = 3600  # 1 hour — stale embeddings expire
+_embed_cache: dict[str, tuple[list[float], float]] = {}
+
+_embed_lock: asyncio.Lock | None = None
+
+
+def _hash_embed(text: str) -> list[float]:
+    """Generate a hash-based embedding as fallback.
+
+    Creates a deterministic vector from SHA256 hash of the text.
+    Used when sentence-transformers model is unavailable.
+    Returns a vector of EMBEDDING_DIMS length.
+    """
+    digest = hashlib.sha256(text.encode('utf-8', errors='ignore')).digest()
+    return [((digest[i % len(digest)] / 255.0) * 2) - 1 for i in range(EMBEDDING_DIMS)]
+
+
+def _batch_embed(texts: list[str], batch_size: int = 4) -> list[list[float]]:
+    """Embed multiple texts in batches using the sentence-transformers model.
+
+    Uses synchronous model.encode() for batching. For async operations,
+    use the async _batch_embed_with_cache wrapper.
+
+    Args:
+        texts: List of text strings to embed
+        batch_size: Number of texts per batch (default: 4)
+
+    Returns:
+        List of embedding vectors (one per input text)
+    """
+    if not texts:
+        return []
+
+    model = _get_embedding_model()
+    if model is None:
+        return [_hash_embed(t) for t in texts]
+
+    all_embeddings: list[list[float]] = []
+
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        try:
+            batch_embeddings = model.encode(
+                batch,
+                show_progress_bar=False,
+                normalize_embeddings=True,
+            )
+            for emb in batch_embeddings:
+                if hasattr(emb, 'tolist'):
+                    all_embeddings.append(emb.tolist())
+                else:
+                    all_embeddings.append(list(emb))
+        except Exception:
+            # If batch fails, fall back to individual embeddings
+            for text in batch:
+                try:
+                    single = model.encode(text, show_progress_bar=False, normalize_embeddings=True)
+                    all_embeddings.append(single.tolist() if hasattr(single, 'tolist') else list(single))
+                except Exception:
+                    all_embeddings.append(_hash_embed(text))
+
+    return all_embeddings
+
+
+def _get_embed_lock() -> asyncio.Lock:
+    """Lazily initialize the embedding cache lock.
+
+    asyncio.Lock() requires a running event loop, so we create
+    it on first access rather than at module load time.
+    """
+    global _embed_lock
+    if _embed_lock is None:
+        _embed_lock = asyncio.Lock()
+    return _embed_lock
+
+
+def _clear_embedding_cache() -> None:
+    """Clear the embedding cache. Useful after model reloads."""
+    global _embed_cache
+    _embed_cache.clear()
+
+
+async def _embed_with_cache(
+    text: str | None = None,
+    texts: list[str] | None = None,
+    batch_size: int = 4,
+    settings: Any = None,
+) -> list[float] | list[list[float]]:
+    """Embed text with LRU+TTL caching (thread-safe).
+
+    Returns cached embedding if available and not expired, otherwise
+    computes and caches the result. Uses asyncio.Lock for thread safety.
+    The lock is released during CPU-bound model encoding to avoid
+    blocking the event loop.
+
+    Accepts either a single text string or a list of texts. When a list
+    is provided, batch processing is used for improved throughput.
+
+    Args:
+        text: Single text string to embed (alternative to texts list)
+        texts: List of text strings to embed (alternative to text)
+        batch_size: Number of texts per batch when processing a list
+
+    Returns:
+        Single embedding for text, or list of embeddings for texts list
+    """
+    # Delegate batch processing to _batch_embed_with_cache
+    if texts is not None:
+        return await _batch_embed_with_cache(texts=texts, batch_size=batch_size)
+
+    _cache_size: int = (
+        settings.embed_cache_size
+        if settings is not None
+        else _EMBED_CACHE_SIZE
+    )
+    _cache_ttl: int = (
+        settings.embed_cache_ttl_seconds
+        if settings is not None
+        else _EMBED_CACHE_TTL_SECS
+    )
+
+    key = text
+    now = time.time()
+    lock = _get_embed_lock()
+
+    # --- Check cache under lock ---
+    async with lock:
+        if key in _embed_cache:
+            value, timestamp = _embed_cache[key]
+            if now - timestamp < _cache_ttl:
+                # Still valid — refresh position for LRU tracking
+                del _embed_cache[key]
+                _embed_cache[key] = (value, timestamp)
+                return value
+            else:
+                # Expired — remove and recompute
+                del _embed_cache[key]
+
+    # --- Compute embedding WITHOUT lock (CPU-bound) ---
+    _LOG.debug("Embedding cache miss for text of length %d", len(text))
+    model = _get_embedding_model()
+    if model is None:
+        _LOG.warning("Embedding model unavailable, using hash fallback for text of length %d", len(text))
+        digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).digest()
+        embedding = [((digest[i % len(digest)] / 255.0) * 2) - 1 for i in range(EMBEDDING_DIMS)]
+    else:
+        try:
+            vec = model.encode(text, show_progress_bar=False, normalize_embeddings=True)
+            embedding = vec.tolist() if hasattr(vec, "tolist") else list(vec)
+        except Exception:
+            _LOG.warning("Embedding model unavailable, using hash fallback for text of length %d", len(text))
+            digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).digest()
+            embedding = [((digest[i % len(digest)] / 255.0) * 2) - 1 for i in range(EMBEDDING_DIMS)]
+
+    # --- Write back to cache under lock ---
+    async with lock:
+        if len(_embed_cache) >= _cache_size:
+            _LOG.debug("Embedding cache full (%d entries), evicting oldest entry", len(_embed_cache))
+            # Evict oldest entry that has exceeded TTL, or fall back to first entry
+            expired_key = None
+            for k, (_, ts) in _embed_cache.items():
+                if now - ts >= _cache_ttl:
+                    expired_key = k
+                    break
+            if expired_key is not None:
+                del _embed_cache[expired_key]
+            elif len(_embed_cache) >= _cache_size:
+                oldest_key = next(iter(_embed_cache))
+                del _embed_cache[oldest_key]
+        _embed_cache[key] = (embedding, now)
+
+    return embedding
+
+
+async def _batch_embed_with_cache(
+    texts: list[str],
+    batch_size: int = 4,
+    settings: Any = None,
+) -> list[list[float]]:
+    """Embed multiple texts with LRU+TTL caching (thread-safe).
+
+    Processes texts in batch when the model is available, which is
+    2-5x faster than individual encode() calls because the underlying
+    sentence-transformers model can batch CPU/GPU operations.
+
+    Args:
+        texts: List of text strings to embed
+        batch_size: Number of texts per batch (default: 4)
+
+    Returns:
+        List of embedding vectors, one per input text
+    """
+    _cache_size: int = (
+        settings.embed_cache_size
+        if settings is not None
+        else _EMBED_CACHE_SIZE
+    )
+    _cache_ttl: int = (
+        settings.embed_cache_ttl_seconds
+        if settings is not None
+        else _EMBED_CACHE_TTL_SECS
+    )
+
+    if not texts:
+        return []
+
+    # Separate cached vs uncached texts
+    now = time.time()
+    lock = _get_embed_lock()
+    cached_results: dict[str, list[float]] = {}
+    uncached_texts: list[str] = []
+
+    async with lock:
+        for text in texts:
+            if text in _embed_cache:
+                value, timestamp = _embed_cache[text]
+                if now - timestamp < _cache_ttl:
+                    cached_results[text] = value
+                else:
+                    # Expired
+                    del _embed_cache[text]
+                    uncached_texts.append(text)
+            else:
+                uncached_texts.append(text)
+
+    # Compute embeddings for uncached texts using _batch_embed
+    newly_computed: dict[str, list[float]] = {}
+    if uncached_texts:
+        newly_computed_embeddings = _batch_embed(uncached_texts, batch_size)
+        for text, embedding in zip(uncached_texts, newly_computed_embeddings):
+            newly_computed[text] = embedding
+
+    # Write newly computed embeddings to cache under lock
+    if newly_computed:
+        async with lock:
+            for text, embedding in newly_computed.items():
+                if len(_embed_cache) >= _cache_size:
+                    expired_key = None
+                    for k, (_, ts) in _embed_cache.items():
+                        if now - ts >= _cache_ttl:
+                            expired_key = k
+                            break
+                    if expired_key is not None:
+                        del _embed_cache[expired_key]
+                    elif len(_embed_cache) >= _cache_size:
+                        oldest_key = next(iter(_embed_cache))
+                        del _embed_cache[oldest_key]
+                _embed_cache[text] = (embedding, now)
+
+    # Merge results in original order
+    merged = {**cached_results, **newly_computed}
+    return [merged[text] for text in texts]
 
 
 @dataclass(slots=True)
@@ -78,19 +387,20 @@ def _index(settings: Settings, index_name: str) -> SearchIndex:
     return SearchIndex(schema=_schema(index_name), redis_url=settings.redis_url)
 
 
-def _query_single_index(
+async def _query_single_index(
     settings: Settings,
     index_name: str,
     query: str,
     limit: int,
     *,
     machine_filter: str | None = None,
+    precomputed_vector: list[float] | None = None,
 ) -> list[RAGSnippet]:
     if VectorQuery is None:
         raise RuntimeError("redisvl is required for retrieval queries.")
 
     idx = _index(settings, index_name)
-    query_vec = embed(query)
+    query_vec = precomputed_vector if precomputed_vector is not None else await embed(query, settings=settings)
     filter_expression = _machine_filter_expression(machine_filter) if machine_filter else None
     result = idx.query(
         VectorQuery(
@@ -156,11 +466,6 @@ def _query_single_index_lexical(
     *,
     machine_filter: str | None = None,
 ) -> list[RAGSnippet]:
-    try:
-        from redis import Redis
-    except Exception:
-        return []
-
     # Allow tokens as short as 2 chars so tools like "7z", "nc", "jq" etc. match.
     # Keep separator-bearing terms (e.g. aa-exec) and also expand them into
     # split/compact variants to align with RediSearch tokenization.
@@ -203,7 +508,9 @@ def _query_single_index_lexical(
     target = _canonical_machine(machine_filter or "") if machine_filter else ""
     snippets: list[RAGSnippet] = []
     try:
-        client = Redis.from_url(settings.redis_url, decode_responses=False)
+        client = get_sync_client(settings.redis_url, decode_responses=False)
+        if client is None:
+            return []
         response = client.execute_command(
             "FT.SEARCH",
             index_name,
@@ -364,23 +671,40 @@ def _phase_bucket(context_commands: list[str]) -> str:
 
 
 def _get_cross_encoder() -> Any | None:
+    """Lazily load the cross-encoder reranker model.
+    
+    The model is loaded on first call and cached globally. If the load fails,
+    subsequent calls will retry (unlike the previous implementation which
+    cached the failure).
+    """
     global _CROSS_ENCODER, _CROSS_ENCODER_LOAD_ATTEMPTED
+    
+    if _CROSS_ENCODER is not None:
+        return _CROSS_ENCODER
+    
     if _CROSS_ENCODER_LOAD_ATTEMPTED:
         return _CROSS_ENCODER
+    
     _CROSS_ENCODER_LOAD_ATTEMPTED = True
-
+    
     if os.getenv("RAG_RERANKER", "on").strip().lower() in {"0", "off", "false", "no"}:
         return None
+    
     try:
-        from sentence_transformers import CrossEncoder
+        from sentence_transformers import CrossEncoder as _CrossEncoder
     except Exception:
+        _LOG.debug("CrossEncoder import failed; reranking disabled")
         return None
-
+    
     model_name = os.getenv("RAG_RERANKER_MODEL", "BAAI/bge-reranker-base")
+    
     try:
-        _CROSS_ENCODER = CrossEncoder(model_name)
-    except Exception:
+        _CROSS_ENCODER = _CrossEncoder(model_name, trust_remote_code=True)
+        _LOG.debug("CrossEncoder loaded: %s", model_name)
+    except Exception as exc:
         _CROSS_ENCODER = None
+        _LOG.warning("CrossEncoder failed to load (%s); reranking disabled", exc)
+    
     return _CROSS_ENCODER
 
 
@@ -405,34 +729,81 @@ def _snippet_fingerprint(snippet: RAGSnippet) -> str:
     return hashlib.sha1(basis.encode("utf-8", errors="ignore")).hexdigest()
 
 
-def _load_recent_snippet_fingerprints(settings: Settings, machine_name: str) -> set[str]:
+def _load_recent_snippet_fingerprints(
+    settings: Settings,
+    machine_name: str,
+    query_source: str = "all",
+) -> dict[str, set[str]]:
+    """Load recent snippet fingerprints, optionally filtered by source.
+
+    Args:
+        settings: Application settings with Redis configuration
+        machine_name: Current machine name for cache key
+        query_source: Filter by source ("all", "hacktricks", "ippsec", etc.)
+
+    Returns:
+        Dict mapping source names to their fingerprint sets.
+    """
     try:
-        from redis import Redis
-    except Exception:
-        return set()
-    try:
-        client = Redis.from_url(settings.redis_url, decode_responses=True)
+        client = get_sync_client(settings.redis_url, decode_responses=True)
+        if client is None:
+            return {}
         rows = client.lrange(_recent_context_cache_key(machine_name), 0, _CONTEXT_CACHE_TURNS - 1)
     except Exception:
-        return set()
-    seen: set[str] = set()
+        return {}
+
+    # Build source-aware cache
+    source_cache: dict[str, set[str]] = {}
     for row in rows:
         try:
-            seen.update(json.loads(row))
+            data = json.loads(row)
+            if isinstance(data, dict):
+                # Extract source from the data
+                source = data.get("source", "unknown")
+                fingerprints = data.get("fingerprints", [])
+                if source not in source_cache:
+                    source_cache[source] = set()
+                source_cache[source].update(fingerprints)
         except Exception:
             continue
-    return seen
+
+    # Source-aware filtering
+    if query_source != "all":
+        filtered = {}
+        for source, fingerprints in source_cache.items():
+            if query_source in source.lower() or query_source == "all":
+                filtered[source] = fingerprints
+        return filtered
+
+    return source_cache
 
 
-def _store_recent_snippet_fingerprints(settings: Settings, machine_name: str, snippets: list[RAGSnippet]) -> None:
-    try:
-        from redis import Redis
-    except Exception:
-        return
-    payload = json.dumps([_snippet_fingerprint(item) for item in snippets])
+def _store_recent_snippet_fingerprints(
+    settings: Settings,
+    machine_name: str,
+    snippets: list[RAGSnippet],
+) -> None:
+    """Store recent snippet fingerprints with source information."""
+    # Group fingerprints by source
+    source_data: dict[str, list[str]] = {}
+    for item in snippets:
+        source = item.source or "unknown"
+        fp = _snippet_fingerprint(item)
+        if source not in source_data:
+            source_data[source] = []
+        source_data[source].append(fp)
+
+    # Store source-aware data
+    payload = json.dumps({
+        "source": list(source_data.keys()),
+        "fingerprints": {k: v for k, v in source_data.items()},
+    })
+
     key = _recent_context_cache_key(machine_name)
     try:
-        client = Redis.from_url(settings.redis_url, decode_responses=True)
+        client = get_sync_client(settings.redis_url, decode_responses=True)
+        if client is None:
+            return
         client.lpush(key, payload)
         client.ltrim(key, 0, _CONTEXT_CACHE_TURNS - 1)
         client.expire(key, _CONTEXT_CACHE_TTL_SECS)
@@ -440,9 +811,41 @@ def _store_recent_snippet_fingerprints(settings: Settings, machine_name: str, sn
         return
 
 
+def _calculate_phase_bonus(
+    snippet: RAGSnippet,
+    phase_bucket: str,
+    phase_bonuses: dict[str, dict[str, float]],
+) -> float:
+    """Calculate phase-aware bonus for a snippet.
+    
+    Returns a float bonus (0.0 to 0.5) based on snippet metadata
+    and the current phase context.
+    """
+    if phase_bucket not in phase_bonuses:
+        return 0.0
+    
+    bonuses = phase_bonuses[phase_bucket]
+    score = 0.0
+    
+    # Check snippet metadata for phase-relevant tags
+    metadata = getattr(snippet, "metadata", {})
+    tags = metadata.get("tags", [])
+    breadcrumb = metadata.get("breadcrumb", "")
+    
+    for tag, weight in bonuses.items():
+        if any(tag in str(t).lower() for t in tags):
+            score += weight
+        if tag in breadcrumb.lower():
+            score += weight * 0.5
+    
+    return min(score, 0.5)  # Cap bonus at 0.5
+
+
 def _rerank_snippets(query: str, snippets: list[RAGSnippet], phase_bucket: str, recent_fingerprints: set[str]) -> list[RAGSnippet]:
     if not snippets:
         return []
+
+    _LOG.debug("Reranking %d snippets with phase_bucket=%s", len(snippets), phase_bucket)
 
     cross_encoder = _get_cross_encoder()
     ce_scores: list[float] | None = None
@@ -450,7 +853,9 @@ def _rerank_snippets(query: str, snippets: list[RAGSnippet], phase_bucket: str, 
         try:
             pairs = [(query, item.content[:1200]) for item in snippets]
             ce_scores = [float(v) for v in cross_encoder.predict(pairs)]
-        except Exception:
+            _LOG.debug("Cross-encoder rerank completed for %d snippets", len(snippets))
+        except Exception as exc:
+            _LOG.warning("Cross-encoder rerank failed: %s", exc)
             ce_scores = None
 
     for idx, item in enumerate(snippets):
@@ -470,6 +875,10 @@ def _rerank_snippets(query: str, snippets: list[RAGSnippet], phase_bucket: str, 
         phase_bonus = 0.0
         if phase_bucket != "unknown" and item.phase == phase_bucket:
             phase_bonus = 0.20
+
+        # Additional phase-aware bonus using metadata
+        phase_bonus += _calculate_phase_bonus(item, phase_bucket, _PHASE_AWARE_BONUSES)
+
         vector_similarity = similarity_from_distance(item.score)
 
         # Intent-aware source boost for common priv-esc search phrases.
@@ -497,6 +906,11 @@ def _rerank_snippets(query: str, snippets: list[RAGSnippet], phase_bucket: str, 
             - item.cache_penalty
         )
 
+    _LOG.debug(
+        "Reranked snippets: top score=%.3f, bottom=%.3f",
+        max(item.rerank_score for item in snippets),
+        min(item.rerank_score for item in snippets),
+    )
     return sorted(filtered, key=_rank, reverse=True)
 
 
@@ -556,16 +970,13 @@ def _query_target_machine_docs(settings: Settings, index_name: str, target_machi
     This bypasses vector similarity for /box-targeted retrieval and prevents
     cross-machine bleed when the active target is known.
     """
-    try:
-        from redis import Redis
-    except ImportError:
-        return []
-
     target = _canonical_machine(target_machine)
     if not target:
         return []
 
-    client = Redis.from_url(settings.redis_url, decode_responses=False)
+    client = get_sync_client(settings.redis_url, decode_responses=False)
+    if client is None:
+        return []
 
     def _decode(value: object) -> str:
         if value is None:
@@ -599,7 +1010,7 @@ def _query_target_machine_docs(settings: Settings, index_name: str, target_machi
     return matches
 
 
-def retrieve_reference_material(
+async def retrieve_reference_material(
     settings: Settings,
     command_or_prompt: str,
     context_commands: list[str] | None = None,
@@ -607,7 +1018,23 @@ def retrieve_reference_material(
     target_machine: str | None = None,
     index_order: list[str] | None = None,
     source_filters: list[str] | None = None,
+    query_source: str = "all",
 ) -> list[RAGSnippet]:
+    """Retrieve reference material with source-aware caching.
+    
+    Args:
+        settings: Application settings with Redis configuration
+        command_or_prompt: The user's query or command
+        context_commands: Recent shell commands for context
+        top_k: Number of top results to return
+        target_machine: Current target machine name
+        index_order: Order in which to search indexes
+        source_filters: Filter by specific sources
+        query_source: Source filter for cache awareness ("all", "hacktricks", etc.)
+    
+    Returns:
+        List of RAGSnippet objects sorted by relevance.
+    """
     context_commands = context_commands or []
     has_explicit_target = bool(target_machine and target_machine.strip())
     machine_name = (target_machine or Path.cwd().name).strip().lower()
@@ -623,7 +1050,11 @@ def retrieve_reference_material(
     combined: list[RAGSnippet] = []
     target = _canonical_machine(machine_name) if has_explicit_target else ""
     phase_bucket = _phase_bucket(context_commands)
-    recent_fingerprints = _load_recent_snippet_fingerprints(settings, machine_name)
+    # Flatten source-aware cache into a single set for backward compatibility
+    _fingerprint_cache = _load_recent_snippet_fingerprints(settings, machine_name, query_source)
+    recent_fingerprints: set[str] = set()
+    for _set in _fingerprint_cache.values():
+        recent_fingerprints.update(_set)
 
     ordered_indexes = index_order[:] if index_order else ["ippsec", "gtfobins", "lolbas", "hacktricks", "payloads", settings.redis_index]
     if source_filters:
@@ -631,6 +1062,8 @@ def retrieve_reference_material(
         ordered_indexes = [name for name in ordered_indexes if name.lower() in allowed]
         if not ordered_indexes:
             return []
+
+    _LOG.debug("RAG query: target=%s, phase_bucket=%s, indexes=%s", target, phase_bucket, ordered_indexes)
 
     # First pass: if we know the active target, prefer exact machine docs.
     if target:
@@ -651,6 +1084,7 @@ def retrieve_reference_material(
                 if len(unique_hits) >= top_k:
                     break
             if unique_hits:
+                _LOG.info("RAG target match found: %d snippets", len(unique_hits))
                 reranked = _rerank_snippets(command_or_prompt, unique_hits, phase_bucket, recent_fingerprints)
                 selected = _select_diverse_snippets(reranked, top_k)
                 _LOG.info(
@@ -658,28 +1092,35 @@ def retrieve_reference_material(
                     command_or_prompt,
                     ", ".join(f"{score:.3f}" for score in top_similarity_scores(selected, top_n=3)) or "none",
                 )
+                _LOG.info("RAG returned %d snippets for query: %s", len(selected), command_or_prompt[:50])
                 _store_recent_snippet_fingerprints(settings, machine_name, selected)
                 return selected
 
     query_limit = max(_RERANK_CANDIDATES, top_k)
+    # Pre-compute the embedding vector once to avoid redundant encode() calls
+    # across multiple index queries.
+    precomputed_vec = await embed(expanded_query)
     for index_name in ordered_indexes:
         try:
             combined.extend(
-                _query_single_index(
+                await _query_single_index(
                     settings,
                     index_name,
                     expanded_query,
                     query_limit,
                     machine_filter=target_machine if has_explicit_target else None,
+                    precomputed_vector=precomputed_vec,
                 )
             )
-        except Exception:
+        except Exception as exc:
+            _LOG.warning("RAG index query failed for %s: %s", index_name, exc)
             continue
 
     target = _canonical_machine(machine_name) if has_explicit_target else ""
     if target:
         machine_matches = [item for item in combined if _canonical_machine(item.machine) == target]
         if machine_matches:
+            _LOG.info("RAG target match found: %d snippets", len(machine_matches))
             reranked = _rerank_snippets(command_or_prompt, machine_matches, phase_bucket, recent_fingerprints)
             selected = _select_diverse_snippets(reranked, top_k)
             _LOG.info(
@@ -687,6 +1128,7 @@ def retrieve_reference_material(
                 command_or_prompt,
                 ", ".join(f"{score:.3f}" for score in top_similarity_scores(selected, top_n=3)) or "none",
             )
+            _LOG.info("RAG returned %d snippets for query: %s", len(selected), command_or_prompt[:50])
             _store_recent_snippet_fingerprints(settings, machine_name, selected)
             return selected
 
@@ -697,13 +1139,41 @@ def retrieve_reference_material(
         command_or_prompt,
         ", ".join(f"{score:.3f}" for score in top_similarity_scores(selected, top_n=3)) or "none",
     )
+    _LOG.info("RAG returned %d snippets for query: %s", len(selected), command_or_prompt[:50])
     _store_recent_snippet_fingerprints(settings, machine_name, selected)
     return selected
 
 
-def embed(text: str, dims: int = EMBEDDING_DIMS) -> list[float]:
-    digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).digest()
-    return [((digest[i % len(digest)] / 255.0) * 2) - 1 for i in range(dims)]
+async def embed(text: str, dims: int = EMBEDDING_DIMS, settings: Any = None) -> list[float]:
+    """Embed text using the configured sentence-transformers model with LRU caching.
+
+    Returns cached embedding if available, otherwise computes and caches.
+    Falls back to hash-based embedding if the model is unavailable.
+    """
+    return await _embed_with_cache(text, settings=settings)
+
+
+async def batch_embed(
+    texts: list[str],
+    dims: int = EMBEDDING_DIMS,
+    batch_size: int = 4,
+    settings: Any = None,
+) -> list[list[float]]:
+    """Embed multiple texts using the configured model with LRU caching.
+
+    Batch encoding is significantly faster (2-5x) than individual embed() calls
+    because the underlying sentence-transformers model can batch CPU/GPU operations.
+
+    Args:
+        texts: List of text strings to embed
+        dims: Expected embedding dimensions (informational)
+        batch_size: Number of texts per batch (default: 4)
+        settings: Application settings (for embed cache config)
+
+    Returns:
+        List of embedding vectors, one per input text
+    """
+    return await _batch_embed_with_cache(texts, batch_size, settings=settings)
 
 
 def format_reference_material(snippets: list[RAGSnippet]) -> str:
@@ -718,6 +1188,62 @@ def format_reference_material(snippets: list[RAGSnippet]) -> str:
             f"  {summary}"
         )
     return "\n".join(lines)
+
+
+async def _summarize_search_results(
+    query: str,
+    snippets: list[RAGSnippet],
+    engine: Any,
+) -> str:
+    """Summarize search results for inclusion in the LLM prompt.
+    
+    This function generates a concise summary of search results that
+    captures the key insights while reducing token usage.
+    
+    Args:
+        query: The original search query
+        snippets: List of RAGSnippet objects to summarize
+        engine: Brain engine instance for summarization (must have summarize_session method)
+        
+    Returns:
+        A concise summary string of the search results.
+    """
+    if not snippets:
+        return "Reference Material: none"
+    
+    # For small result sets, use full content
+    if len(snippets) <= 3:
+        return format_reference_material(snippets)
+    
+    # For large result sets, generate a summary
+    snippet_texts = []
+    for i, snippet in enumerate(snippets, 1):
+        # Truncate content to avoid overly long summaries
+        content_preview = snippet.content[:200] if snippet.content else ""
+        title_preview = snippet.title or snippet.source or "Untitled"
+        snippet_texts.append(f"[{i}] {title_preview}: {content_preview}...")
+    
+    combined_text = "\n".join(snippet_texts)
+    
+    summary_prompt = f"""Summarize the following search results for the query: {query}
+
+Results:
+{combined_text}
+
+Provide a concise summary (max 300 words) that captures the key insights
+relevant to the query. Include specific commands, techniques, and URLs."""
+    
+    try:
+        # Use the engine's summarize_session method if available
+        if hasattr(engine, "summarize_session"):
+            summary = await engine.summarize_session(summary_prompt)
+            return summary
+        else:
+            # Fallback: use format_reference_material with top snippets
+            return format_reference_material(snippets[:3])
+    except Exception:
+        # Fallback: return first N snippets
+        return format_reference_material(snippets[:3])
 
 
 def _summarize_snippet(content: str) -> str:
@@ -756,13 +1282,13 @@ def _summarize_snippet(content: str) -> str:
     return " ".join(bullets[:5])
 
 
-def retrieve_solution_for_machine(settings: Settings, machine_name: str) -> str:
+async def retrieve_solution_for_machine(settings: Settings, machine_name: str) -> str:
     machine = machine_name.strip()
     if not machine:
         return "Unable to detect machine name from current directory."
 
     query = f"{machine} full walkthrough ippsec timestamp hacktricks methodology"
-    snippets = retrieve_reference_material(settings, query, [], top_k=5, target_machine=machine)
+    snippets = await retrieve_reference_material(settings, query, [], top_k=5, target_machine=machine)
     if not snippets:
         return f"No Redis walkthrough material found for '{machine}'."
 

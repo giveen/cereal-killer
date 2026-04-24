@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import hashlib
 import os
 import re
@@ -13,11 +17,11 @@ from redisvl.query import VectorQuery
 from redisvl.schema import IndexSchema
 
 from cereal_killer.config import Settings, get_settings
+from mentor.kb.redis_pool import get_async_pool, get_async_client, get_sync_client, reset_pools
+from mentor.kb.query import EMBEDDING_DIMS as _EMBEDDING_DIMS
+from mentor.kb.query import embed as _embed_fn
 
 IPPSEC_DATASET_URL = "https://raw.githubusercontent.com/IppSec/ippsec.github.io/master/dataset.json"
-# Lightweight deterministic embedding size for hash-based fallback vectors.
-# 64 dims keeps storage/query overhead low while still producing stable ordering.
-EMBEDDING_DIMS = 64
 
 
 def _vector_to_bytes(values: list[float]) -> bytes:
@@ -43,7 +47,7 @@ class KnowledgeBase:
                         "type": "vector",
                         "attrs": {
                             "algorithm": "flat",
-                            "dims": EMBEDDING_DIMS,
+                            "dims": _EMBEDDING_DIMS,
                             "distance_metric": "cosine",
                             "datatype": "float32",
                         },
@@ -53,22 +57,24 @@ class KnowledgeBase:
         )
 
     def _index(self) -> SearchIndex:
+        client = get_sync_client(self.settings.redis_url, decode_responses=False)
+        if client is not None:
+            return SearchIndex(schema=self._schema(), redis_client=client)
+        # Fall back to redis_url if pool client unavailable
         return SearchIndex(schema=self._schema(), redis_url=self.settings.redis_url)
 
     def index(self) -> SearchIndex:
         return self._index()
 
     @staticmethod
-    def embed(text: str, dims: int = EMBEDDING_DIMS) -> list[float]:
-        # Deterministic hash embedding fallback for environments without embedding models.
-        digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).digest()
-        vals = [((digest[i % len(digest)] / 255.0) * 2) - 1 for i in range(dims)]
-        return vals
+    async def embed(text: str, dims: int = _EMBEDDING_DIMS) -> list[float]:
+        """Embed text using the configured embedding model (sentence-transformers or hash fallback)."""
+        return await _embed_fn(text)
 
-    def lookup_walkthrough(self, query: str = "full machine walkthrough") -> str:
+    async def lookup_walkthrough(self, query: str = "full machine walkthrough") -> str:
         try:
             idx = self.index()
-            query_vec = self.embed(query)
+            query_vec = await self.embed(query)
             result = idx.query(
                 VectorQuery(
                     vector=query_vec,
@@ -86,8 +92,11 @@ class KnowledgeBase:
         doc = docs[0]
         return f"{doc.get('machine', 'Unknown')} - {doc.get('title', 'Walkthrough')}\n{doc.get('url', '')}\n\n{doc.get('content', '')}"
 
+    def close(self) -> None:
+        reset_pools()
 
-def transform_dataset(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+
+async def transform_dataset(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
     docs: list[dict[str, Any]] = []
 
     def _normalize_machine(raw: str) -> str:
@@ -192,7 +201,7 @@ def transform_dataset(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "title": title,
                     "url": url,
                     "content": content,
-                    "embedding": _vector_to_bytes(KnowledgeBase.embed(content)),
+                    "embedding": _vector_to_bytes(await KnowledgeBase.embed(content)),
                 }
             )
             doc_id += 1
@@ -202,7 +211,7 @@ def transform_dataset(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return docs
 
 
-def sync_ippsec_dataset() -> None:
+async def sync_ippsec_dataset() -> None:
     settings = get_settings()
     kb = KnowledgeBase(settings)
     source = os.getenv("IPPSEC_DATASET_URL", IPPSEC_DATASET_URL)
@@ -216,7 +225,7 @@ def sync_ippsec_dataset() -> None:
     else:
         data = payload
 
-    docs = transform_dataset(data)
+    docs = await transform_dataset(data)
     index = kb.index()
     # Keep existing index configuration/data unless it does not exist yet.
     index.create(overwrite=False, drop=False)

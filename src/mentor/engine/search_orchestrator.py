@@ -199,7 +199,7 @@ async def tiered_search(
 
     async def _run_pipeline() -> SearchResult:
         # --- Tier 1: Local Redis Vector DB -----------------------------------
-        vector_snippets = retrieve_reference_material(
+        vector_snippets = await retrieve_reference_material(
             settings,
             command_or_prompt=query,
             context_commands=history_commands,

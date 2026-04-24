@@ -3,10 +3,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+import time
+
 try:
     from redis.asyncio import Redis
 except ImportError:  # pragma: no cover - run without redis package in minimal environments
     Redis = None  # type: ignore[assignment]
+
+from mentor.kb.redis_pool import get_async_client
 
 from cereal_killer.config import Settings
 
@@ -28,13 +32,17 @@ class MentalState:
 class ThinkingSessionStore:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self._cache: dict[str, str] = {}
+        self._cache_timestamps: dict[str, float] = {}
+        self._cache_ttl: int = settings.session_cache_ttl if hasattr(settings, 'session_cache_ttl') else 300  # 5 minutes default, configurable via SESSION_CACHE_TTL
         self._redis: Redis | None = None
 
     async def _client(self) -> Redis | None:
-        if Redis is None:
-            return None
         if self._redis is None:
-            self._redis = Redis.from_url(self.settings.redis_url, decode_responses=True)
+            self._redis = get_async_client(
+                self.settings.redis_url,
+                decode_responses=True
+            )
         return self._redis
 
     @staticmethod
@@ -66,6 +74,7 @@ class ThinkingSessionStore:
         try:
             await client.rpush(key, clean)
             await client.ltrim(key, -keep_last, -1)
+            self._invalidate_cache(self._key(machine_name))
         except Exception:
             return
 
@@ -79,7 +88,20 @@ class ThinkingSessionStore:
         return blob
 
     async def thinking_buffer(self, machine_name: str, max_chars: int = 6000) -> str:
-        return await self.cumulative_trace(machine_name, char_limit=max_chars)
+        cache_key = f"thinking_buffer:{machine_name}"
+        
+        # Check cache
+        if cache_key in self._cache and self._is_cache_valid(cache_key):
+            return self._cache[cache_key]
+        
+        # Fetch fresh data
+        result = await self.cumulative_trace(machine_name, char_limit=max_chars)
+        
+        # Update cache
+        self._cache[cache_key] = result
+        self._cache_timestamps[cache_key] = time.time()
+        
+        return result
 
     async def save_mental_state(
         self,
@@ -148,6 +170,7 @@ class ThinkingSessionStore:
             return
         try:
             await client.delete(self._key(machine_name))
+            self._invalidate_cache(self._key(machine_name))
         except Exception:
             return
 
@@ -164,6 +187,7 @@ class ThinkingSessionStore:
             await client.delete(key)
             await client.rpush(key, clean)
             await client.expire(key, 60 * 60 * 24 * 7)
+            self._invalidate_cache(self._key(machine_name))
         except Exception:
             return
 
@@ -257,3 +281,14 @@ class ThinkingSessionStore:
                 "max_model_len": self.settings.max_model_len,
             },
         }
+
+    def _is_cache_valid(self, key: str) -> bool:
+        """Check if the cache entry is still valid."""
+        if key not in self._cache_timestamps:
+            return False
+        return time.time() - self._cache_timestamps[key] < self._cache_ttl
+
+    def _invalidate_cache(self, key: str) -> None:
+        """Invalidate the cache entry for a given key."""
+        self._cache.pop(key, None)
+        self._cache_timestamps.pop(key, None)

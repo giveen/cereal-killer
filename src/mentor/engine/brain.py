@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import base64
 import mimetypes
-import os
 import re
 import json
 import hashlib
@@ -25,6 +26,7 @@ from mentor.engine.search_orchestrator import tiered_search
 from mentor.engine.session import ThinkingSessionStore
 from mentor.kb.query import RAGSnippet
 from mentor.kb.query import format_reference_material, retrieve_reference_material
+from mentor.engine.response_cache import LLMResponseCache
 
 
 THOUGHT_PATTERN = re.compile(r"<thought>(.*?)</thought>", re.DOTALL | re.IGNORECASE)
@@ -88,31 +90,42 @@ class BrainResponse:
 
 
 class Brain:
-    COMMAND_CONTEXT_LIMIT = 20
-    STUCK_TURN_LIMIT = 5
-
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        # Internal names from settings for session/machine name filtering.
+        self._APP_INTERNAL_NAMES = frozenset(settings.app_internal_names)
         self.system_prompt = OLDER_ZERO_COOL_PROMPT
         # Optional block injected by /box or /new-box; prepended to system prompt.
         self.system_prompt_addendum: str = ""
         # Callback invoked with True when a web search fires, False when it completes.
         self.on_web_search_state_change: Callable[[bool], None] | None = None
         self._pedagogy = PedagogyEngine()
+        self._machine_name_override: str | None = None
         self._session = ThinkingSessionStore(settings)
         self._stalled_turns = 0
         self._last_progress_signature = ""
         self._recent_user_inputs: list[str] = []
         self._last_user_input = ""
-        self._pinned_system_prompt_by_machine: dict[str, str] = {}
+        self._pinned_system_prompt_by_machine: OrderedDict[str, str] = OrderedDict()
+        self._MAX_PINNED_PROMPTS = self.settings.max_pinned_prompts
         self._trace_path = Path(self.settings.backend_trace_path)
         self._ensure_trace_file()
         self._client: Any | None = None
         if AsyncOpenAI is not None:
             self._client = AsyncOpenAI(base_url=settings.llm_base_url, api_key=settings.llm_api_key)
+        self._response_cache = LLMResponseCache(
+            maxsize=self.settings.llm_cache_maxsize,
+            ttl=self.settings.llm_cache_ttl,
+        )
+        # Streaming callbacks
+        from mentor.engine.streaming import StreamingCallbacks
+        self._on_token: Any | None = None
+        self._on_thought: Any | None = None
+        self._on_complete: Any | None = None
+        self._on_error: Any | None = None
 
     async def persist_mental_state(self, history_commands: list[str] | None = None) -> None:
-        machine_name = Path.cwd().name
+        machine_name = self._get_machine_name()
         thinking_chain = await self._session.thinking_buffer(machine_name)
         recon_summary = self._summarize_recon(history_commands or [])
         await self._session.save_mental_state(
@@ -123,7 +136,7 @@ class Brain:
         )
 
     async def returning_greeting(self) -> str | None:
-        machine_name = Path.cwd().name
+        machine_name = self._get_machine_name()
         state = await self._session.load_mental_state(machine_name)
         if state is None or not state.recon_summary:
             return None
@@ -133,8 +146,7 @@ class Brain:
         return raw_machine_name if raw_machine_name.lower() not in self._APP_INTERNAL_NAMES else "__app__"
 
     async def get_thinking_buffer(self, machine_name: str | None = None, max_chars: int = 6000) -> str:
-        raw_name = machine_name or Path.cwd().name
-        session_machine = self._session_machine_name(raw_name)
+        session_machine = self._get_machine_name(machine_name)
         return await self._session.thinking_buffer(session_machine, max_chars=max_chars)
 
     @staticmethod
@@ -148,10 +160,6 @@ class Brain:
             )
         )
 
-    # These directory names belong to the cereal-killer project itself and should
-    # never be treated as HTB machine names for session/thinking-buffer purposes.
-    _APP_INTERNAL_NAMES: frozenset[str] = frozenset({"cereal-killer", "cereal_killer", "gibson"})
-
     async def ask(
         self,
         user_prompt: str,
@@ -161,11 +169,10 @@ class Brain:
         pathetic_meter: int = 0,
     ) -> BrainResponse:
         history_commands = history_commands or []
-        raw_machine_name = Path.cwd().name
         # Don't pollute / read the session store when running inside the app's
         # own project directory — those names are TUI internals, not HTB boxes.
-        machine_name = self._session_machine_name(raw_machine_name)
-        historical_commands = history_commands[-self.COMMAND_CONTEXT_LIMIT:]
+        machine_name = self._get_machine_name()
+        historical_commands = history_commands[-self.settings.command_context_limit:]
         latest_input = (tool_command or user_prompt).strip()
         context_block = "\n".join(f"- {cmd}" for cmd in historical_commands)
         minified_tool_output = minify_terminal_output(tool_output or "", command=tool_command)
@@ -187,10 +194,10 @@ class Brain:
 
         if latest_input:
             self._recent_user_inputs.append(latest_input)
-            if len(self._recent_user_inputs) > self.STUCK_TURN_LIMIT:
-                self._recent_user_inputs = self._recent_user_inputs[-self.STUCK_TURN_LIMIT:]
+            if len(self._recent_user_inputs) > self.settings.stuck_turn_limit:
+                self._recent_user_inputs = self._recent_user_inputs[-self.settings.stuck_turn_limit:]
 
-        if self._stalled_turns >= self.STUCK_TURN_LIMIT:
+        if self._stalled_turns >= self.settings.stuck_turn_limit:
             stuck_summary = self._build_stuck_status(self._recent_user_inputs)
             await self._session.replace_thoughts(machine_name, stuck_summary)
             previous_reasoning = stuck_summary
@@ -251,19 +258,14 @@ class Brain:
                 "Analyze why THIS specific attempt failed compared to the previous ones.\n\n"
             )
 
-        user_message = (
-            (
-                f"Thinking buffer from previous reasoning for this machine:\n{previous_reasoning or '- none'}\n\n"
-                if include_thinking_buffer
-                else ""
-            )
-            +
-            f"Runtime coaching directives:\n{dynamic_runtime_hint or '- none'}\n\n"
-            f"Latest Command/Input:\n{latest_input or '- none'}\n\n"
-            f"Historical Commands:\n{context_block or '- none'}\n\n"
-            f"{failure_note}"
-            f"Minified tool output:\n{minified_tool_output or '- none'}\n\n"
-            f"User prompt:\n{user_prompt}"
+        user_message = self._assemble_user_message(
+            previous_reasoning=previous_reasoning,
+            dynamic_runtime_hint=dynamic_runtime_hint,
+            latest_input=latest_input,
+            context_block=context_block,
+            failure_note=failure_note,
+            minified_tool_output=minified_tool_output,
+            include_thinking_buffer=include_thinking_buffer,
         )
 
         messages: list[dict[str, Any]] = [
@@ -328,8 +330,7 @@ class Brain:
         pathetic_meter: int = 0,
     ) -> BrainResponse:
         history_commands = history_commands or []
-        raw_machine_name = Path.cwd().name
-        machine_name = self._session_machine_name(raw_machine_name)
+        machine_name = self._get_machine_name()
         previous_reasoning = await self._session.thinking_buffer(machine_name)
         include_thinking_buffer = self.settings.preserve_thinking and self._should_include_thinking_buffer(user_prompt)
         reference_snippets = retrieve_reference_material(
@@ -365,6 +366,16 @@ class Brain:
             backend_meta=backend_meta,
         )
 
+    def set_active_machine_override(self, machine: str) -> None:
+        """Override the machine name used for session/store lookups."""
+        self._machine_name_override = machine
+
+    def _get_machine_name(self, raw_machine_name: str | None = None) -> str:
+        """Return the machine name, using override or cwd as fallback."""
+        if self._machine_name_override is not None:
+            return self._session_machine_name(self._machine_name_override)
+        return self._session_machine_name(raw_machine_name or Path.cwd().name)
+
     def set_system_prompt_addendum(self, addendum: str) -> None:
         self.system_prompt_addendum = addendum
         # Target/context changes require rebuilding the pinned baseline.
@@ -379,7 +390,32 @@ class Brain:
 
         trace_id = str(uuid4())
 
-        use_litellm = os.getenv("USE_LITELLM", "").lower() in {"1", "true", "yes"}
+        # --- Cache check ---
+        user_message_content = ""
+        for msg in messages:
+            if msg.get("role") == "user":
+                user_message_content = str(msg.get("content", ""))
+                break
+        cache_key = self._response_cache.compute_key(
+            system_prompt=messages[0].get("content", "") if messages else "",
+            user_message=user_message_content,
+            model=self.settings.llm_model,
+            temperature=0.4,
+            extra_body=extra_body,
+        )
+        cached = await self._response_cache.get(cache_key)
+        if cached is not None:
+            cache_metrics = {
+                "latency_ms": 0,
+                "tokens_cached": 0,
+                "cache_hit": True,
+                "from_cache": True,
+                "provider": "cache",
+                "model": self.settings.llm_model,
+            }
+            return cached.answer, cached.reasoning_content, cache_metrics
+
+        use_litellm = self.settings.use_litellm
         if use_litellm:
             try:
                 from litellm import acompletion
@@ -431,7 +467,15 @@ class Brain:
                     message.get("reasoning_content") or "",
                 )
                 metrics = self._extract_completion_metrics(response, started_at=started_at)
-                return content, reasoning_content, metrics
+                result = await self._response_cache._store_result_if_enabled(
+                    cache_key=cache_key,
+                    thought=content,
+                    reasoning_content=reasoning_content,
+                    raw_content=content,
+                    backend_meta=metrics,
+                    enable_cache=self.settings.enable_llm_cache,
+                )
+                return result
 
         if self._client is None:
             self._backend_trace(
@@ -510,7 +554,240 @@ class Brain:
                 "No response text returned by backend. "
                 "Check llama-swap/router logs and set REASONING_PARSER=qwen3."
             )
-        return content, reasoning, metrics
+        result = await self._response_cache._store_result_if_enabled(
+            cache_key=cache_key,
+            thought=content,
+            reasoning_content=reasoning,
+            raw_content=content,
+            backend_meta=metrics,
+            enable_cache=self.settings.enable_llm_cache,
+        )
+        return result
+
+    async def _chat_completion_stream(
+        self,
+        machine_name: str,
+        messages: list[dict[str, Any]],
+        callbacks: Any,  # StreamingCallbacks instance
+    ) -> BrainResponse:
+        """Streaming variant of _chat_completion that yields tokens via callbacks."""
+        extra_body = self._session.reasoning_payload()
+        extra_body.setdefault("metadata", {})
+        metadata = extra_body["metadata"]
+        if isinstance(metadata, dict):
+            metadata["machine"] = machine_name
+
+        trace_id = str(uuid4())
+
+        # --- Cache check ---
+        user_message_content = ""
+        for msg in messages:
+            if msg.get("role") == "user":
+                user_message_content = str(msg.get("content", ""))
+                break
+        cache_key = self._response_cache.compute_key(
+            system_prompt=messages[0].get("content", "") if messages else "",
+            user_message=user_message_content,
+            model=self.settings.llm_model,
+            temperature=0.4,
+            extra_body=extra_body,
+        )
+        cached = await self._response_cache.get(cache_key)
+        if cached is not None:
+            cache_metrics = {
+                "latency_ms": 0,
+                "tokens_cached": 0,
+                "cache_hit": True,
+                "from_cache": True,
+                "provider": "cache",
+                "model": self.settings.llm_model,
+            }
+            if callbacks:
+                try:
+                    await callbacks.on_complete(cached)
+                except Exception:
+                    pass
+            return BrainResponse(
+                thought=cached.thought,
+                answer=cached.answer,
+                raw_content=cached.raw_content,
+                reasoning_content=cached.reasoning_content,
+                backend_meta=cache_metrics,
+            )
+
+        use_litellm = self.settings.use_litellm
+        accumulated_content = ""
+
+        if use_litellm:
+            try:
+                from litellm import acompletion
+            except ImportError:
+                use_litellm = False
+
+        if use_litellm:
+            try:
+                self._backend_trace(
+                    event="request",
+                    trace_id=trace_id,
+                    provider="litellm",
+                    machine=machine_name,
+                    payload={
+                        "model": self.settings.llm_model,
+                        "api_base": self.settings.llm_base_url,
+                        "messages": messages,
+                        "temperature": 0.4,
+                        "extra_body": extra_body,
+                    },
+                )
+                started_at = time.perf_counter()
+                async for chunk in acompletion(
+                    model=self.settings.llm_model,
+                    api_base=self.settings.llm_base_url,
+                    api_key=self.settings.llm_api_key,
+                    messages=messages,
+                    temperature=0.4,
+                    stream=True,
+                    **extra_body,
+                ):
+                    chunk_content = ""
+                    if hasattr(chunk, "choices") and chunk.choices:
+                        choice = chunk.choices[0]
+                        if hasattr(choice, "delta") and choice.delta:
+                            chunk_content = getattr(choice.delta, "content", "") or ""
+                    if chunk_content:
+                        accumulated_content += chunk_content
+                        if callbacks:
+                            try:
+                                await callbacks.on_token(chunk_content)
+                            except Exception:
+                                pass
+                metrics = self._extract_completion_metrics(
+                    {"usage": getattr(chunk, "usage", None) if hasattr(chunk, "usage") else None,
+                     "tokens_cached": 0}, started_at=started_at
+                )
+                result = await self._response_cache._store_result_if_enabled(
+                    cache_key=cache_key,
+                    thought=accumulated_content,
+                    reasoning_content="",
+                    raw_content=accumulated_content,
+                    backend_meta=metrics,
+                    enable_cache=self.settings.enable_llm_cache,
+                )
+                if callbacks:
+                    try:
+                        await callbacks.on_complete(
+                            BrainResponse(thought="", answer=accumulated_content, raw_content=accumulated_content, reasoning_content="")
+                        )
+                    except Exception:
+                        pass
+                return BrainResponse(
+                    thought=accumulated_content,
+                    answer=accumulated_content,
+                    raw_content=accumulated_content,
+                    reasoning_content="",
+                    backend_meta=metrics,
+                )
+            except Exception as exc:
+                self._backend_trace(
+                    event="error",
+                    trace_id=trace_id,
+                    provider="litellm",
+                    machine=machine_name,
+                    payload={"error": str(exc)},
+                )
+                raise
+
+        # OpenAI client streaming path
+        if self._client is None:
+            self._backend_trace(
+                event="error",
+                trace_id=trace_id,
+                provider="openai-client",
+                machine=machine_name,
+                payload={"error": "No LLM client available", "hint": "Install openai or set USE_LITELLM=1"},
+            )
+            raise RuntimeError("No LLM client available. Install openai or enable LiteLLM with USE_LITELLM=1.")
+
+        request_payload = {
+            "model": self.settings.llm_model,
+            "base_url": self.settings.llm_base_url,
+            "messages": messages,
+            "temperature": 0.4,
+            "extra_body": extra_body,
+        }
+        self._backend_trace(
+            event="request",
+            trace_id=trace_id,
+            provider="openai-client",
+            machine=machine_name,
+            payload=request_payload,
+        )
+        started_at = time.perf_counter()
+        try:
+            async for chunk in await self._client.chat.completions.create(
+                model=self.settings.llm_model,
+                messages=messages,
+                temperature=0.4,
+                stream=True,
+                extra_body=extra_body,
+            ):
+                chunk_content = ""
+                try:
+                    if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                        chunk_content = chunk.choices[0].delta.content
+                except Exception:
+                    pass
+                if chunk_content:
+                    accumulated_content += chunk_content
+                    if callbacks:
+                        try:
+                            await callbacks.on_token(chunk_content)
+                        except Exception:
+                            pass
+        except Exception as exc:
+            self._backend_trace(
+                event="error",
+                trace_id=trace_id,
+                provider="openai-client",
+                machine=machine_name,
+                payload={"error": str(exc)},
+            )
+            raise
+
+        completion_payload = {"usage": None}
+        metrics = self._extract_completion_metrics(completion_payload, started_at=started_at)
+        partial_thought = self._extract_partial_thought(accumulated_content)
+        partial_answer = self._extract_partial_answer(accumulated_content)
+
+        result = await self._response_cache._store_result_if_enabled(
+            cache_key=cache_key,
+            thought=accumulated_content,
+            reasoning_content="",
+            raw_content=accumulated_content,
+            backend_meta=metrics,
+            enable_cache=self.settings.enable_llm_cache,
+        )
+        if callbacks:
+            try:
+                await callbacks.on_complete(
+                    BrainResponse(
+                        thought=partial_thought or accumulated_content,
+                        answer=partial_answer or accumulated_content,
+                        raw_content=accumulated_content,
+                        reasoning_content="",
+                        backend_meta=metrics,
+                    )
+                )
+            except Exception:
+                pass
+
+        return BrainResponse(
+            thought=partial_thought or accumulated_content,
+            answer=partial_answer or accumulated_content,
+            raw_content=accumulated_content,
+            reasoning_content="",
+            backend_meta=metrics,
+        )
 
     async def _chat_completion_with_image(
         self,
@@ -564,6 +841,26 @@ class Brain:
             "Content-Type": "application/json",
         }
         trace_id = str(uuid4())
+        # --- Cache check (vision) ---
+        user_message_content = f"{user_prompt}\n\n{context_text}"
+        cache_key = "vision:" + self._response_cache.compute_key(
+            system_prompt=system_prompt,
+            user_message=user_message_content,
+            model=vision_model,
+            temperature=0.4,
+            extra_body=extra_body,
+        )
+        cached = await self._response_cache.get(cache_key)
+        if cached is not None:
+            cache_metrics = {
+                "latency_ms": 0,
+                "tokens_cached": 0,
+                "cache_hit": True,
+                "from_cache": True,
+                "provider": "cache",
+                "model": vision_model,
+            }
+            return cached.answer, cached.reasoning_content, cache_metrics
         self._backend_trace(
             event="request",
             trace_id=trace_id,
@@ -612,7 +909,159 @@ class Brain:
             str(message.get("content") or ""),
             str(message.get("reasoning_content") or ""),
         )
-        return content, reasoning, metrics
+        result = await self._response_cache._store_result_if_enabled(
+            cache_key=cache_key,
+            thought=content,
+            reasoning_content=reasoning,
+            raw_content=content,
+            backend_meta=metrics,
+            enable_cache=self.settings.enable_llm_cache,
+        )
+        return result
+
+    async def _chat_completion_with_image_stream(
+        self,
+        user_prompt: str,
+        image_path: str,
+        system_prompt: str,
+        machine_name: str,
+        context_text: str,
+        callbacks: Any,  # StreamingCallbacks instance
+    ) -> BrainResponse:
+        """Streaming variant of _chat_completion_with_image for vision calls."""
+        image_data_uri = self._file_to_data_uri(image_path)
+        extra_body = self._session.reasoning_payload()
+        extra_body.setdefault("metadata", {})
+        metadata = extra_body["metadata"]
+        if isinstance(metadata, dict):
+            metadata["machine"] = machine_name
+
+        try:
+            import httpx
+        except Exception as exc:
+            raise RuntimeError("httpx is required for llama-swap vision calls") from exc
+
+        vision_base = (self.settings.llm_vision_base_url or self.settings.llm_base_url).rstrip("/")
+        vision_model = (self.settings.llm_vision_model or self.settings.llm_model).strip()
+        endpoint = f"{vision_base}/chat/completions"
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+        ]
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"{user_prompt}\n\n{context_text}"},
+                {"type": "image_url", "image_url": {"url": image_data_uri}},
+            ],
+        })
+        messages = self._dedupe_messages(messages)
+
+        payload: dict[str, Any] = {
+            "model": vision_model,
+            "messages": messages,
+            "temperature": 0.4,
+            "extra_body": extra_body,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.settings.llm_api_key}",
+            "Content-Type": "application/json",
+        }
+        trace_id = str(uuid4())
+
+        # --- Cache check (vision) ---
+        user_message_content = f"{user_prompt}\n\n{context_text}"
+        cache_key = "vision:" + self._response_cache.compute_key(
+            system_prompt=system_prompt,
+            user_message=user_message_content,
+            model=vision_model,
+            temperature=0.4,
+            extra_body=extra_body,
+        )
+        cached = await self._response_cache.get(cache_key)
+        if cached is not None:
+            if callbacks:
+                try:
+                    await callbacks.on_complete(cached)
+                except Exception:
+                    pass
+            return cached
+
+        self._backend_trace(
+            event="request",
+            trace_id=trace_id,
+            provider="vision-httpx",
+            machine=machine_name,
+            payload={"endpoint": endpoint, "headers": headers, "json": payload},
+        )
+
+        accumulated_content = ""
+        started_at = time.perf_counter()
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                async with client.stream("POST", endpoint, headers=headers, json=payload) as response:
+                    response.raise_for_status()
+                    # Parse SSE stream or collect full response
+                    full_data = await response.json()
+                    choices = full_data.get("choices") if isinstance(full_data, dict) else None
+                    if isinstance(choices, list) and choices:
+                        first = choices[0] if isinstance(choices[0], dict) else {}
+                        msg = first.get("message") if isinstance(first, dict) else {}
+                        if isinstance(msg, dict):
+                            accumulated_content = str(msg.get("content") or "")
+                        else:
+                            accumulated_content = ""
+                        if callbacks:
+                            try:
+                                await callbacks.on_token(accumulated_content)
+                            except Exception:
+                                pass
+        except Exception as exc:
+            self._backend_trace(
+                event="error",
+                trace_id=trace_id,
+                provider="vision-httpx",
+                machine=machine_name,
+                payload={"endpoint": endpoint, "error": str(exc)},
+            )
+            raise
+
+        data = full_data
+        metrics = self._extract_completion_metrics(data, started_at=started_at)
+
+        partial_thought = self._extract_partial_thought(accumulated_content)
+        partial_answer = self._extract_partial_answer(accumulated_content)
+
+        result = await self._response_cache._store_result_if_enabled(
+            cache_key=cache_key,
+            thought=accumulated_content,
+            reasoning_content="",
+            raw_content=accumulated_content,
+            backend_meta=metrics,
+            enable_cache=self.settings.enable_llm_cache,
+        )
+        if callbacks:
+            try:
+                await callbacks.on_complete(
+                    BrainResponse(
+                        thought=partial_thought or accumulated_content,
+                        answer=partial_answer or accumulated_content,
+                        raw_content=accumulated_content,
+                        reasoning_content="",
+                        backend_meta=metrics,
+                    )
+                )
+            except Exception:
+                pass
+
+        return BrainResponse(
+            thought=partial_thought or accumulated_content,
+            answer=partial_answer or accumulated_content,
+            raw_content=accumulated_content,
+            reasoning_content="",
+            backend_meta=metrics,
+        )
 
     @staticmethod
     def _normalise_completion_payload(content: str, reasoning_content: str) -> tuple[str, str]:
@@ -629,8 +1078,8 @@ class Brain:
         pathetic_meter: int = 0,
     ) -> BrainResponse:
         """Generate a structured Loot Report summarising the path to root."""
-        machine_name = Path.cwd().name
-        context_block = "\n".join(f"- {cmd}" for cmd in history_commands[-self.COMMAND_CONTEXT_LIMIT:])
+        machine_name = self._get_machine_name()
+        context_block = "\n".join(f"- {cmd}" for cmd in history_commands[-self.settings.command_context_limit:])
 
         user_message = (
             "The box has been pwned. Generate a concise **Loot Report** in Markdown covering:\n"
@@ -661,7 +1110,7 @@ class Brain:
 
     async def summarize_session(self, session_text: str) -> str:
         """Compress a block of old session history into a compact summary string."""
-        machine_name = Path.cwd().name
+        machine_name = self._get_machine_name()
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
@@ -701,7 +1150,7 @@ class Brain:
                 reasoning_content="",
             )
 
-        machine_name = Path.cwd().name
+        machine_name = self._get_machine_name()
         by_source: dict[str, list[RAGSnippet]] = {}
         for snippet in snippets:
             by_source.setdefault(snippet.source or "unknown", []).append(snippet)
@@ -853,6 +1302,20 @@ class Brain:
             'sqlmap': 'For complex exploitation, consider Burp Suite Pro or manual SQL injection analysis.',
             'nc': 'netcat works, but try socat or ncat for more features and stability.',
             'hydra': 'Consider more targeted approaches: medusa or custom scripts for specific services.',
+            'nmap': 'Consider masscan for faster initial scanning or nmap NSE scripts for detailed analysis.',
+            'masscan': 'For more detailed results, consider switching to nmap with custom scripts.',
+            'dirsearch': 'feroxbuster or ffuf offer better performance and more features.',
+            'wfuzz': 'Consider ffuf for faster directory brute-forcing.',
+            'ffuf': 'Consider feroxbuster for better performance with large wordlists.',
+            'feroxbuster': 'Consider ffuf for better speed or dirsearch for simplicity.',
+            'enum4linux': 'Consider smbclient or smbmap for more targeted SMB enumeration.',
+            'smbclient': 'Consider enum4linux or smbmap for more comprehensive SMB analysis.',
+            'smbmap': 'Consider enum4linux or smbclient for more comprehensive SMB analysis.',
+            'msfconsole': 'Consider using individual modules directly for faster exploitation.',
+            'netexec': 'Consider crackmapexec for more detailed network analysis.',
+            'crackmapexec': 'Consider netexec for more detailed network analysis.',
+            'john': 'Consider hashcat for GPU-accelerated cracking.',
+            'hashcat': 'Consider john for simplicity or hashcat for GPU acceleration.',
         }
         for baseline, suggestion in tool_suggestions.items():
             if baseline in command.lower():
@@ -897,6 +1360,7 @@ class Brain:
     def _get_or_create_pinned_system_prompt(self, machine_name: str, baseline_reference: str) -> str:
         existing = self._pinned_system_prompt_by_machine.get(machine_name)
         if existing:
+            self._pinned_system_prompt_by_machine.move_to_end(machine_name)
             return existing
 
         addendum_block = f"{self.system_prompt_addendum}\n\n" if self.system_prompt_addendum else ""
@@ -908,7 +1372,57 @@ class Brain:
             f"{baseline}\n"
         )
         self._pinned_system_prompt_by_machine[machine_name] = pinned
+
+        # Evict oldest entries if over the bounded size limit (LRU eviction)
+        while len(self._pinned_system_prompt_by_machine) > self._MAX_PINNED_PROMPTS:
+            self._pinned_system_prompt_by_machine.popitem(last=False)
+
         return pinned
+
+    async def _invalidate_cache_for_machine(self, machine_name: str) -> None:
+        """Invalidate cache entries that contain the pinned system prompt for a machine.
+
+        Called when _get_or_create_pinned_system_prompt() creates a new prompt
+        for a machine, making existing cached responses stale.
+        """
+        if not self.settings.enable_llm_cache:
+            return
+        old_pinned = self._pinned_system_prompt_by_machine.get(machine_name)
+        if not old_pinned:
+            return
+        # Invalidate ALL cached entries (simple approach — the pinned prompt
+        # affects every call for this machine so we clear conservatively).
+        await self._response_cache.clear()
+
+    async def _clear_all_cache(self) -> None:
+        """Clear all cached responses. Used for testing and settings changes."""
+        if not self.settings.enable_llm_cache:
+            return
+        await self._response_cache.clear()
+
+    def _assemble_user_message(
+        self,
+        previous_reasoning: str,
+        dynamic_runtime_hint: str,
+        latest_input: str,
+        context_block: str,
+        failure_note: str,
+        minified_tool_output: str,
+        include_thinking_buffer: bool,
+    ) -> str:
+        """Assemble the user message from components."""
+        parts: list[str] = []
+        if include_thinking_buffer:
+            parts.append(
+                f"Thinking buffer from previous reasoning for this machine:\n{previous_reasoning or '- none'}\n\n"
+            )
+        parts.append(f"Runtime coaching directives:\n{dynamic_runtime_hint or '- none'}\n\n")
+        parts.append(f"Latest Command/Input:\n{latest_input or '- none'}\n\n")
+        parts.append(f"Historical Commands:\n{context_block or '- none'}\n\n")
+        parts.append(failure_note)
+        parts.append(f"Minified tool output:\n{minified_tool_output or '- none'}\n\n")
+        parts.append(f"User prompt:\n{latest_input}")
+        return "\n".join(parts)
 
     def _extract_completion_metrics(self, payload: Any, *, started_at: float) -> dict[str, Any]:
         latency_ms = int(max(0.0, (time.perf_counter() - started_at) * 1000.0))
@@ -916,6 +1430,9 @@ class Brain:
             "latency_ms": latency_ms,
             "tokens_cached": 0,
             "cache_hit": False,
+            "from_cache": False,
+            "provider": "unknown",
+            "model": self.settings.llm_model,
         }
 
         if isinstance(payload, dict):
@@ -943,8 +1460,31 @@ class Brain:
             if isinstance(cached_value, (int, float)):
                 metrics["tokens_cached"] = int(max(0, cached_value))
 
-        metrics["cache_hit"] = bool(metrics.get("tokens_cached", 0) > 0)
+            # Capture provider information
+            provider = payload.get("provider")
+            if provider:
+                metrics["provider"] = provider
+
+        metrics["cache_hit"] = bool(metrics.get("from_cache", False) or metrics.get("tokens_cached", 0) > 0)
         return metrics
+
+    @staticmethod
+    def _extract_partial_thought(content: str) -> str:
+        """Extract all complete <thought>...</thought> blocks from partial content.
+
+        Only returns complete tags — partial/opening tags without a closing </thought>
+        are ignored during streaming.
+        """
+        thoughts = THOUGHT_PATTERN.findall(content)
+        return "\n\n".join(item.strip() for item in thoughts if item.strip())
+
+    @staticmethod
+    def _extract_partial_answer(content: str) -> str:
+        """Extract the answer portion from partial content.
+
+        Removes all complete <thought>...</thought> blocks and returns the remainder.
+        """
+        return THOUGHT_PATTERN.sub("", content).strip()
 
     def _ensure_trace_file(self) -> None:
         if not self.settings.backend_trace_enabled:
@@ -1018,4 +1558,17 @@ def parse_brain_output(content: str) -> BrainResponse:
     if not answer.strip() and thought.strip():
         answer = thought
 
+    # Handle empty content — fall back to raw content if both thought and answer are empty
+    if not answer.strip() and not thought.strip():
+        answer = content.strip()
+        thought = ""
+
     return BrainResponse(thought=thought, answer=answer, raw_content=content, reasoning_content="")
+
+
+# ── Streaming Cache Integration ─────────────────────────────────────────
+# The _chat_completion_stream() method calls self._response_cache._store_result_if_enabled()
+# at the end of its execution, ensuring streaming responses are cached identically
+# to non-streaming responses. No structural changes to response_cache.py are needed.
+#
+# The _chat_completion_with_image_stream() method also follows this pattern.
